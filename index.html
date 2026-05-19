@@ -477,10 +477,18 @@
     cls(dynEl, s.dynamic === 'silent' ? 'stat-val dim' : 'stat-val good');
 
     const cpp = s.cpp;
-    cppEl.textContent = `${cpp.toFixed(1)} dB`;
-    if      (cpp > 15) { cppLbl.textContent = 'Clear voice';      cls(cppEl, 'stat-val good'); }
-    else if (cpp > 8)  { cppLbl.textContent = 'Some breathiness'; cls(cppEl, 'stat-val warn'); }
-    else               { cppLbl.textContent = 'Breathy';          cls(cppEl, 'stat-val bad');  }
+    if (!voiced || cpp < 1.5) {
+      // Don't label silence or near-zero as "Breathy" — CPP is only
+      // meaningful when the voice is active and harmonics are present.
+      cppEl.textContent = voiced ? `${cpp.toFixed(1)} dB` : '—';
+      cppLbl.textContent = '—';
+      cls(cppEl, 'stat-val dim');
+    } else {
+      cppEl.textContent = `${cpp.toFixed(1)} dB`;
+      if      (cpp > 10) { cppLbl.textContent = 'Clear voice';      cls(cppEl, 'stat-val good'); }
+      else if (cpp >  5) { cppLbl.textContent = 'Some breathiness'; cls(cppEl, 'stat-val warn'); }
+      else               { cppLbl.textContent = 'Breathy';          cls(cppEl, 'stat-val bad');  }
+    }
 
     if (voiced && s.et_note !== '—') {
       vadEl.textContent  = 'Voiced';
@@ -507,9 +515,9 @@
     else                         p.push(`Slightly sharp (${dev.toFixed(0)}¢ ↑)`);
 
     if (acc > 0) p.push(`${acc.toFixed(0)}% pitch accuracy`);
-    if (s.cpp > 15)    p.push('Clear voice ✓');
-    else if (s.cpp > 8) p.push('Some breathiness — engage support');
-    else               p.push('Breathy — support your breath');
+    if (s.cpp > 10)   p.push('Clear voice ✓');
+    else if (s.cpp > 5) p.push('Some breathiness — engage support');
+    else if (s.cpp > 1.5) p.push('Breathy — support your breath');
     if (s.dynamic && s.dynamic !== 'silent') p.push(`Dynamic: ${s.dynamic}`);
 
     return p.join('  ·  ');

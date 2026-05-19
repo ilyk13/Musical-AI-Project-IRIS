@@ -35,7 +35,7 @@ from features.dynamics.dynamic_class import classify_dynamic
 from features.breath.cpp import compute_cpp
 from features.breath.spectral_tilt import compute_spectral_tilt_slope
 from features.vibrato.bandpass import bandpass_vibrato
-from model.nanopitch import bin_to_f0, PITCH_BINS
+from model.nanopitch import bin_to_f0
 
 # ── Constants ──────────────────────────────────────────────────────────
 SR             = 16_000
@@ -87,69 +87,17 @@ _NOTE_NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B']
 def _hz_to_et(hz: float) -> tuple[float, str, float]:
     if hz <= 0:
         return 0.0, '—', 0.0
-    semitones    = 12.0 * np.log2(hz / 440.0)
-    nearest_semi = round(semitones)
-    et_hz        = 440.0 * 2.0 ** (nearest_semi / 12.0)
-    deviation    = (semitones - nearest_semi) * 100.0
-    note_idx     = int((nearest_semi % 12 + 12) % 12)
-    octave       = 4 + int(np.floor(nearest_semi / 12))
+    # Convert to MIDI note number (A4 = 69).  MIDI is the unambiguous
+    # standard: note_idx = midi % 12, octave = midi // 12 - 1
+    # (C-1 = MIDI 0, C4 = MIDI 60, A4 = MIDI 69, C5 = MIDI 72 …)
+    midi     = 69.0 + 12.0 * np.log2(hz / 440.0)
+    midi_n   = int(round(midi))
+    et_hz    = 440.0 * 2.0 ** ((midi_n - 69) / 12.0)
+    deviation = (midi - midi_n) * 100.0
+    note_idx  = midi_n % 12
+    octave    = midi_n // 12 - 1
     return et_hz, f"{_NOTE_NAMES[note_idx]}{octave}", float(deviation)
 
-
-# ── Stateful Viterbi ───────────────────────────────────────────────────
-_N = PITCH_BINS  # 360 voiced bins
-
-def _viterbi_step(
-    post: np.ndarray,
-    prev: np.ndarray,
-    transition_width: int = 12,
-    onset_penalty: float = 1.5,
-    voicing_threshold: float = 0.2,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Process one chunk through a stateful greedy Viterbi decoder.
-
-    Args:
-        post:  (T, 360) pitch posteriorgram for the new frames
-        prev:  (_N+1,) log-probability vector from the previous call
-               (all -inf on first call signals cold start)
-    Returns:
-        f0_hz: (T,) decoded fundamental frequency in Hz (0 = unvoiced)
-        new_prev: updated state to pass into the next call
-    """
-    T = post.shape[0]
-    if T == 0:
-        return np.zeros(0, dtype=np.float32), prev
-
-    tw = int(transition_width)
-    W  = 2 * tw + 1
-    f0_hz = np.zeros(T, dtype=np.float32)
-
-    for t in range(T):
-        max_p   = float(post[t].max())
-        log_obs = np.log(post[t] + 1e-10)
-        uv_obs  = np.log(max(1.0 - max_p, 1e-10))
-        curr    = np.full(_N + 1, -np.inf, dtype=np.float64)
-
-        if np.all(np.isinf(prev)):
-            # Cold start
-            if max_p > voicing_threshold:
-                curr[:_N] = log_obs
-            curr[_N] = uv_obs
-        else:
-            padded = np.pad(prev[:_N], (tw, tw), constant_values=-np.inf)
-            wins   = np.lib.stride_tricks.as_strided(
-                padded, shape=(_N, W),
-                strides=(padded.strides[0], padded.strides[0]))
-            best_v = np.max(wins, axis=1)
-            curr[:_N] = np.maximum(best_v, prev[_N] - onset_penalty) + log_obs
-            curr[_N]  = max(prev[_N], float(prev[:_N].max()) - onset_penalty) + uv_obs
-
-        best = int(np.argmax(curr))
-        if best < _N:
-            f0_hz[t] = float(bin_to_f0(float(best)))
-        prev = curr
-
-    return f0_hz, prev
 
 
 # ── Per-connection state ───────────────────────────────────────────────
@@ -168,11 +116,8 @@ class ClientState:
     last_dbfs:       float      = -80.0
     last_dynamic:    str        = "silent"
     cached_vib:      np.ndarray = field(default_factory=lambda: np.zeros(1, dtype=np.float32))
-    # stateful inference — carry GRU hidden states and Viterbi state across chunks
+    # GRU hidden states carried across chunks for continuous temporal context
     gru_states:      list | None = field(default=None)
-    viterbi_prev:    np.ndarray  = field(
-        default_factory=lambda: np.full(_N + 1, -np.inf, dtype=np.float64)
-    )
 
 
 # ── Feature extraction ─────────────────────────────────────────────────
@@ -189,64 +134,54 @@ def _extract(state: ClientState, chunk: np.ndarray,
     n_new  = max(1, len(chunk) // HOP_LENGTH)
     state.chunk_n += 1
 
-    # ── Energy / VAD ────────────────────────────────────────────────
+    # ── Energy / dynamics ────────────────────────────────────────────
     rms_lin = float(np.sqrt(np.mean(chunk ** 2)))
     dbfs    = float(20.0 * np.log10(max(rms_lin, 1e-10)))
-    voiced  = rms_lin > 0.001  # ~−60 dBFS — low to work without browser AGC
 
     state.last_dbfs    = dbfs
     state.last_dynamic = classify_dynamic(dbfs) or "silent"
 
-    # ── Pitch — YIN (always) + NanoPitch (accuracy upgrade) ─────────
-    # YIN runs unconditionally on every voiced chunk: pure DSP, no training-
-    # distribution assumptions, never misses a periodic signal.
-    # NanoPitch runs alongside; where its Viterbi is confident (non-zero f0)
-    # we prefer its output because it's smoother and more pitch-accurate for
-    # singing.  Where NanoPitch is silent, YIN fills in automatically.
+    # ── Pitch — NanoPitch (sole detector) ───────────────────────────
+    # The model has its own Viterbi-based voicing detector; no RMS gate needed.
+    # It naturally outputs 0 on silence.  We only wait until the rolling buffer
+    # has enough audio for the first mel window.
     f0_arr = np.zeros(n_new, dtype=np.float32)
 
-    if state.samples_rx >= MIN_AUDIO_SAMPS and voiced:
+    if state.samples_rx >= MIN_AUDIO_SAMPS and _extractor is not None:
         model_win = buf[-MODEL_WIN:].copy()
-
-        # ── 1. Fast YIN — always runs, always provides a baseline ────
-        f0_yin = np.zeros(n_new, dtype=np.float32)
         try:
-            yin_raw = librosa.yin(
-                model_win, fmin=65.0, fmax=2093.0, sr=SR,
-                hop_length=HOP_LENGTH, frame_length=1024,
-            ).astype(np.float32)
-            yin_raw = np.where((yin_raw >= 65) & (yin_raw <= 2093), yin_raw, 0.0)
-            if len(yin_raw) >= n_new:
-                f0_yin = yin_raw[-n_new:]
-        except Exception:
-            pass
+            mel   = _compute_mel(model_win, sr=SR)
+            mel_t = torch.from_numpy(mel).unsqueeze(0)
 
-        f0_arr = f0_yin  # YIN is always the fallback
-
-        # ── 2. NanoPitch — upgrades accuracy when the model is confident
-        if _extractor is not None:
-            try:
-                mel   = _compute_mel(model_win, sr=SR)
-                mel_t = torch.from_numpy(mel).unsqueeze(0)
-
-                with torch.no_grad():
-                    _, pitch_out, new_gru = _extractor.model(
-                        mel_t, states=state.gru_states
-                    )
-                state.gru_states = new_gru
-
-                post  = pitch_out[0].cpu().numpy()
-                f0_np, state.viterbi_prev = _viterbi_step(
-                    post, state.viterbi_prev
+            with torch.no_grad():
+                vad_out, pitch_out, new_gru = _extractor.model(
+                    mel_t, states=state.gru_states
                 )
-                f0_np = np.where((f0_np >= 65) & (f0_np <= 2093), f0_np, 0.0)
+            state.gru_states = new_gru
 
-                if len(f0_np) >= n_new:
-                    f0_np_latest = f0_np[-n_new:]
-                    # Prefer NanoPitch where it's confident; YIN elsewhere
-                    f0_arr = np.where(f0_np_latest > 0, f0_np_latest, f0_yin)
-            except Exception as exc:
-                print(f"  [NanoPitch inference error] {exc}")
+            # ── Decode pitch ────────────────────────────────────────
+            # Strategy: greedy argmax for the pitch bin (avoids the
+            # "stuck-in-unvoiced" failure mode of Viterbi cold-start),
+            # then gate voiced/unvoiced using the model's own VAD head
+            # (trained explicitly for this binary decision) plus a
+            # minimum-confidence check on the pitch posterior.
+            post          = pitch_out[0].cpu().numpy()       # (T, 360)
+            vad_probs     = vad_out[0, :, 0].cpu().numpy()  # (T,)
+            max_post_frame = post.max(axis=1)                # (T,)
+            pitch_bins    = post.argmax(axis=1)              # (T,)
+            f0_greedy     = bin_to_f0(pitch_bins.astype(np.float64)).astype(np.float32)
+
+            # Voiced if VAD head is confident OR the pitch peak is clear.
+            # Using OR makes the detector more sensitive — either head can
+            # trigger voiced, reducing missed detections.
+            voiced_mask = (vad_probs > 0.2) | (max_post_frame > 0.15)
+            f0_raw = np.where(voiced_mask, f0_greedy, 0.0)
+            f0_raw = np.where((f0_raw >= 55) & (f0_raw <= 2093), f0_raw, 0.0)
+
+            if len(f0_raw) >= n_new:
+                f0_arr = f0_raw[-n_new:].astype(np.float32)
+        except Exception as exc:
+            print(f"  [NanoPitch inference error] {exc}")
 
         if len(f0_arr) >= 3:
             f0_arr = medfilt(f0_arr, kernel_size=3).astype(np.float32)

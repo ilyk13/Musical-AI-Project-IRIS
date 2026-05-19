@@ -41,19 +41,19 @@ Browser microphone  (Web Audio API, 2048-sample chunks ≈ 46 ms)
 │  Python server  (FastAPI + uvicorn)                         │
 │                                                             │
 │  ┌──────────────────────────────────────────────────────┐   │
-│  │  Pitch  ·  NanoPitch GRU on 128 ms window           │   │
-│  │          →  360-bin posteriorgram + VAD              │   │
-│  │          →  Viterbi (realtime) → f0 in Hz            │   │
+│  │  Pitch  ·  NanoPitch GRU on 100 ms window           │   │
+│  │          →  360-bin pitch posteriorgram + VAD prob   │   │
+│  │          →  greedy argmax + VAD-head gate → f0 Hz   │   │
 │  │          →  3-frame median smooth                    │   │
 │  │          →  central pitch  (median filter on 3 s)   │   │
 │  │          →  ET deviation & pitch accuracy %         │   │
 │  ├──────────────────────────────────────────────────────┤   │
 │  │  Dynamics  ·  RMS → dBFS → pp/p/mp/mf/f/ff          │   │
 │  ├──────────────────────────────────────────────────────┤   │
-│  │  Breathiness  ·  CPP + spectral tilt (every 3 chunks)│   │
+│  │  Breathiness  ·  CPP + spectral tilt (every 15 chunks│   │
 │  ├──────────────────────────────────────────────────────┤   │
 │  │  Vibrato  ·  4.5–8 Hz band-pass on f0 rolling buffer │   │
-│  │             Savitzky-Golay smooth (every 8 chunks)   │   │
+│  │             Savitzky-Golay smooth (every 50 chunks)  │   │
 │  └──────────────────────────────────────────────────────┘   │
 │                                                             │
 │  JSON frames over WebSocket  (~10 updates/second)           │
@@ -110,7 +110,7 @@ IRIS/
 ├── runs/
 │   └── exp1/
 │       ├── checkpoints/
-│       │   └── best.pth          # Best trained NanoPitch checkpoint (50 epochs)
+│       │   └── best.pth          # Best trained NanoPitch checkpoint (48 epochs)
 │       └── tb/                   # TensorBoard event logs
 │
 └── utils/
@@ -142,7 +142,7 @@ Concat [conv_out, gru1, gru2, gru3]   ← 384-dim skip connection
     └──→ Linear(384→360) + sigmoid    → pitch posteriorgram
 ```
 
-The 360 output bins cover B0–B6 (31.7–2006 Hz) at 20 cents/bin resolution. A **Viterbi decoder** converts the posteriorgram into a smooth f0 track.
+The 360 output bins cover B0–B6 (31.7–2006 Hz) at 20 cents/bin resolution. At inference, the **greedy argmax** of the pitch posteriorgram selects the most likely bin per frame, and the model's own **VAD head** gates voiced/unvoiced decisions — avoiding the "stuck-in-unvoiced" failure mode of stateful Viterbi on short windows.
 
 Causal convolutions (left-padding only) ensure the model never looks at future frames, making it suitable for real-time streaming.
 
@@ -165,7 +165,7 @@ tensorboard --logdir runs/exp1/tb                      # monitor training
 
 A trained checkpoint lives at `runs/exp1/checkpoints/best.pth` (50 epochs).
 
-To use the trained model in the live app, update `app.py`'s `_extract` function to use `NanoPitchExtractor.from_pretrained(local_path="runs/exp1/checkpoints/best.pth")` in place of `librosa.yin`.
+The live app loads this checkpoint automatically at startup via `NanoPitchExtractor.from_pretrained(local_path="runs/exp1/checkpoints/best.pth")`.
 
 ---
 
@@ -173,7 +173,7 @@ To use the trained model in the live app, update `app.py`'s `_extract` function 
 
 ### Pitch (f0)
 
-The live app uses the **trained NanoPitch GRU model** (`runs/exp1/checkpoints/best.pth`) for pitch extraction. On each 128 ms rolling window, a log-mel spectrogram is computed and fed to the model. The model outputs a per-frame pitch posteriorgram and VAD probability. `viterbi_decode_realtime` converts the posteriorgram into a smooth f0 track, and the model's VAD head gates voiced/unvoiced decisions directly.
+The live app uses the **trained NanoPitch GRU model** (`runs/exp1/checkpoints/best.pth`) for pitch extraction. On each 100 ms rolling window, a 40-band log-mel spectrogram is computed (16 kHz, 10 ms hop, 25 ms window, ε = 1e-10) and fed through the model's GRU stack. The model simultaneously outputs a 360-bin pitch posteriorgram and a per-frame VAD probability. Pitch is decoded by taking the **argmax** of the posteriorgram each frame; the frame is declared voiced if `VAD > 0.2` or `max_posterior > 0.15`. GRU hidden states are carried across chunks so the model maintains temporal context across the full session.
 
 **Central pitch** is the median-filtered f0 over a 3-second rolling buffer — this removes short-term vibrato and micro-variations to reveal the intended note. The deviation from the nearest equal-temperament note is displayed as a tuner needle (±50 cents).
 
@@ -220,7 +220,7 @@ The live dashboard shows:
 | Package | Use |
 |---|---|
 | `torch` | NanoPitch model, training |
-| `librosa` | pYIN / YIN pitch detection, audio resampling, mel spectrograms |
+| `librosa` | Audio resampling, mel spectrograms |
 | `scipy` | Band-pass filter, median filter, Savitzky-Golay smoother |
 | `numpy` | All numerical computation |
 | `fastapi` + `uvicorn` | Web server and WebSocket |

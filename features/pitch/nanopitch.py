@@ -49,11 +49,10 @@ def _compute_mel(audio: np.ndarray, sr: int = SR) -> np.ndarray:
         fmax=FMAX,
         power=2.0,   # log-power mel — matches the NanoPitch-PreExtract training data
     )
-    log_mel = np.log(mel + 1e-7).T  # (frames, 40)
-
-    # Mean-subtract so the model is robust to absolute microphone level
-    # differences vs the training distribution (same trick used in RNNoise).
-    log_mel = log_mel - log_mel.mean()
+    # Epsilon matches NanoPitch-PreExtract: training data floor is -23.031,
+    # which equals log(1e-10).  Using 1e-7 would raise the floor to -16.1,
+    # making silence look like a weak voiced signal to the model.
+    log_mel = np.log(mel + 1e-10).T  # (frames, 40)
 
     return log_mel.astype(np.float32)
 
