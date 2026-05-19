@@ -1,0 +1,624 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>IRIS — AI Vocal Coach</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:      #0f0f1a;
+      --card:    #1a1a2e;
+      --border:  #252540;
+      --dim:     #555577;
+      --text:    #ccccee;
+      --blue:    #7eb8f7;
+      --orange:  #ff9f43;
+      --purple:  #a29bfe;
+      --green:   #55efc4;
+      --yellow:  #fdcb6e;
+      --red:     #e17055;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    /* ── Start overlay ────────────────────────────────────────────── */
+    #overlay {
+      position: fixed;
+      inset: 0;
+      background: #0f0f1af0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 100;
+      backdrop-filter: blur(6px);
+    }
+    .overlay-box {
+      text-align: center;
+      padding: 48px 56px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      max-width: 420px;
+    }
+    .overlay-box h1 {
+      font-size: 2.2rem;
+      font-weight: 800;
+      color: var(--blue);
+      letter-spacing: 4px;
+      margin-bottom: 6px;
+    }
+    .overlay-box .tagline { font-size: 0.85rem; color: var(--dim); margin-bottom: 32px; }
+    #startBtn {
+      background: var(--blue);
+      color: var(--bg);
+      border: none;
+      padding: 14px 38px;
+      border-radius: 30px;
+      font-size: 1rem;
+      font-weight: 700;
+      cursor: pointer;
+      letter-spacing: 0.5px;
+      transition: transform 0.12s, background 0.12s;
+    }
+    #startBtn:hover  { background: #a8d0ff; transform: scale(1.04); }
+    #startBtn:active { transform: scale(0.97); }
+    .overlay-note { margin-top: 16px; font-size: 0.74rem; color: #444466; }
+    #overlayError { margin-top: 12px; font-size: 0.8rem; color: var(--red); display: none; }
+
+    /* ── Header ──────────────────────────────────────────────────── */
+    header {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      padding: 9px 20px;
+      background: #13132a;
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    .logo { font-size: 1.3rem; font-weight: 800; color: var(--blue); letter-spacing: 3px; }
+    .logo .sub { font-size: 0.76rem; font-weight: 400; color: var(--dim); margin-left: 10px; letter-spacing: 0; }
+    .live-badge {
+      display: flex; align-items: center; gap: 6px;
+      padding: 3px 10px;
+      border: 1px solid var(--red);
+      border-radius: 20px;
+      font-size: 0.7rem; font-weight: 700;
+      color: var(--red); letter-spacing: 1.5px;
+    }
+    .live-dot {
+      width: 7px; height: 7px;
+      background: var(--red); border-radius: 50%;
+      animation: pulse 1.2s ease-in-out infinite;
+    }
+    @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.15; } }
+    .timer { font-family: 'Courier New', monospace; font-size: 1rem; color: var(--dim); margin-left: auto; }
+    .conn { font-size: 0.72rem; padding: 3px 9px; border-radius: 10px; background: #1e1e3a; color: var(--dim); border: 1px solid var(--border); }
+    .conn.ok { color: var(--green); border-color: #55efc440; }
+
+    /* ── Layout ──────────────────────────────────────────────────── */
+    main {
+      flex: 1;
+      display: grid;
+      grid-template-rows: 1fr 200px 44px;
+      gap: 9px;
+      padding: 9px;
+      overflow: hidden;
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 11px 14px;
+      overflow: hidden;
+    }
+    .card-title {
+      font-size: 0.66rem;
+      text-transform: uppercase;
+      letter-spacing: 2px;
+      color: var(--dim);
+      margin-bottom: 7px;
+    }
+
+    /* ── Pitch card ──────────────────────────────────────────────── */
+    .pitch-card { display: flex; flex-direction: column; }
+    .pitch-header {
+      display: flex; align-items: center; justify-content: space-between;
+      margin-bottom: 5px; flex-shrink: 0;
+    }
+    .legend { display: flex; gap: 12px; font-size: 0.7rem; }
+    .legend-item { display: flex; align-items: center; gap: 5px; }
+    .swatch { width: 16px; height: 3px; border-radius: 2px; }
+    .pitch-chart-wrap { flex: 1; position: relative; min-height: 0; }
+
+    /* ── Bottom row ──────────────────────────────────────────────── */
+    .bottom-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr 300px;
+      gap: 9px;
+    }
+
+    /* ── Tuner card ──────────────────────────────────────────────── */
+    .tuner-card { display: flex; flex-direction: column; }
+    .note-display {
+      text-align: center;
+      font-size: 2rem;
+      font-weight: 800;
+      color: var(--orange);
+      line-height: 1;
+      margin: 4px 0;
+    }
+    .tuner-wrap { position: relative; margin: 4px 6px 0; }
+    .tuner-track {
+      height: 14px;
+      border-radius: 7px;
+      background: linear-gradient(to right,
+        var(--red) 0%, var(--yellow) 22%, var(--green) 38%,
+        var(--green) 62%, var(--yellow) 78%, var(--red) 100%);
+      position: relative;
+    }
+    .tuner-needle {
+      position: absolute;
+      top: -3px;
+      width: 3px;
+      height: 20px;
+      background: white;
+      border-radius: 2px;
+      transform: translateX(-50%);
+      left: 50%;
+      transition: left 0.08s linear;
+      box-shadow: 0 0 4px rgba(255,255,255,0.6);
+    }
+    .tuner-labels {
+      display: flex; justify-content: space-between;
+      font-size: 0.62rem; color: var(--dim);
+      margin-top: 4px; padding: 0 2px;
+    }
+    .accuracy-row {
+      display: flex; align-items: center; justify-content: space-between;
+      margin-top: 6px;
+    }
+    .accuracy-label { font-size: 0.68rem; color: var(--dim); text-transform: uppercase; letter-spacing: 1px; }
+    .accuracy-val { font-size: 1.2rem; font-weight: 700; }
+    .et-dev { font-size: 0.75rem; text-align: center; margin-top: 2px; }
+
+    /* ── Vibrato card ────────────────────────────────────────────── */
+    .vib-card { display: flex; flex-direction: column; }
+    .vib-chart-wrap { flex: 1; position: relative; min-height: 0; }
+
+    /* ── Stats card ──────────────────────────────────────────────── */
+    .stats-card { display: flex; flex-direction: column; justify-content: space-between; }
+    .stat { display: flex; align-items: center; justify-content: space-between; flex: 1; }
+    .stat-label { font-size: 0.66rem; text-transform: uppercase; letter-spacing: 1.5px; color: var(--dim); }
+    .stat-val { font-size: 1.45rem; font-weight: 700; line-height: 1; transition: color 0.3s; }
+    .stat-sub { font-size: 0.7rem; color: var(--dim); margin-top: 2px; }
+    .hr { height: 1px; background: var(--border); }
+    .good { color: var(--green); }
+    .warn { color: var(--yellow); }
+    .bad  { color: var(--red); }
+    .dim  { color: var(--dim); }
+
+    /* ── Feedback bar ────────────────────────────────────────────── */
+    .feedback-bar {
+      display: flex; align-items: center; gap: 10px;
+      padding: 0 16px;
+      background: #13132a;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      font-size: 0.86rem;
+      color: #9999bb;
+    }
+  </style>
+</head>
+<body>
+
+<!-- ── Start overlay ──────────────────────────────────────────────── -->
+<div id="overlay">
+  <div class="overlay-box">
+    <h1>◉ IRIS</h1>
+    <div class="tagline">AI Vocal Coach — Real-time singing analysis</div>
+    <button id="startBtn">🎤 Start Listening</button>
+    <div class="overlay-note">Browser mic permission required.</div>
+    <div id="overlayError"></div>
+  </div>
+</div>
+
+<!-- ── Header ─────────────────────────────────────────────────────── -->
+<header>
+  <div class="logo">◉ IRIS <span class="sub">AI Vocal Coach</span></div>
+  <div class="live-badge"><div class="live-dot"></div>LIVE</div>
+  <div class="timer" id="timer">00:00</div>
+  <div class="conn" id="connEl">Connecting…</div>
+</header>
+
+<!-- ── Main ───────────────────────────────────────────────────────── -->
+<main>
+
+  <!-- Pitch chart -->
+  <div class="card pitch-card">
+    <div class="pitch-header">
+      <span class="card-title" style="margin:0;">Pitch  (NanoPitch)</span>
+      <div class="legend">
+        <div class="legend-item"><div class="swatch" style="background:var(--blue);"></div><span style="color:var(--blue);">f0</span></div>
+        <div class="legend-item"><div class="swatch" style="background:var(--orange);height:2px;"></div><span style="color:var(--orange);">central</span></div>
+      </div>
+    </div>
+    <div class="pitch-chart-wrap">
+      <canvas id="pitchChart"></canvas>
+    </div>
+  </div>
+
+  <!-- Bottom row: Tuner | Vibrato | Stats -->
+  <div class="bottom-row">
+
+    <!-- Tuner -->
+    <div class="card tuner-card">
+      <div class="card-title">Tuner</div>
+      <div class="note-display" id="noteDisplay">—</div>
+      <div class="et-dev dim" id="etDevText">—</div>
+      <div class="tuner-wrap">
+        <div class="tuner-track">
+          <div class="tuner-needle" id="tunerNeedle"></div>
+        </div>
+        <div class="tuner-labels">
+          <span>−50¢</span><span>flat</span><span>in tune</span><span>sharp</span><span>+50¢</span>
+        </div>
+      </div>
+      <div class="accuracy-row">
+        <span class="accuracy-label">Pitch accuracy</span>
+        <span class="accuracy-val good" id="accuracyVal">—%</span>
+      </div>
+    </div>
+
+    <!-- Vibrato -->
+    <div class="card vib-card">
+      <div class="card-title">Vibrato deviation</div>
+      <div class="vib-chart-wrap">
+        <canvas id="vibChart"></canvas>
+      </div>
+    </div>
+
+    <!-- Stats -->
+    <div class="card stats-card">
+      <div class="stat">
+        <div>
+          <div class="stat-label">Dynamic</div>
+          <div class="stat-val dim" id="dynVal">—</div>
+        </div>
+        <div style="text-align:right;">
+          <div class="stat-sub" id="dbfsVal">— dBFS</div>
+        </div>
+      </div>
+      <div class="hr"></div>
+      <div class="stat">
+        <div>
+          <div class="stat-label">Breathiness · CPP</div>
+          <div class="stat-val dim" id="cppVal">—</div>
+        </div>
+        <div style="text-align:right;">
+          <div class="stat-sub" id="cppLbl">—</div>
+        </div>
+      </div>
+      <div class="hr"></div>
+      <div class="stat">
+        <div>
+          <div class="stat-label">Voice activity</div>
+          <div class="stat-val dim" id="vadVal">—</div>
+        </div>
+        <div style="text-align:right;">
+          <div class="stat-sub" id="vadLbl">—</div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- Feedback -->
+  <div class="feedback-bar">
+    <span style="opacity:0.4;">💬</span>
+    <span id="feedbackText">Waiting for audio…</span>
+  </div>
+
+</main>
+
+<script>
+  Chart.defaults.color       = '#555577';
+  Chart.defaults.borderColor = '#252540';
+
+  const PITCH_WIN = 10;  // seconds of pitch shown
+  const VIB_WIN   = 6;   // seconds of vibrato shown
+
+  let pitchData   = [];
+  let centralData = [];
+  let vibData     = [];
+  let latestT     = 0;
+  let startTs     = null;
+
+  // ── Charts ─────────────────────────────────────────────────────────
+  const baseOpts = {
+    animation: false, parsing: false, normalized: true,
+    plugins: { legend: { display: false }, tooltip: { enabled: false } },
+  };
+
+  const pitchChart = new Chart(document.getElementById('pitchChart'), {
+    type: 'line',
+    data: {
+      datasets: [
+        {
+          data: pitchData,
+          borderColor: '#7eb8f7',
+          backgroundColor: '#7eb8f715',
+          pointRadius: 2,
+          borderWidth: 1.5,
+          spanGaps: false,
+          tension: 0,
+          order: 2,
+        },
+        {
+          data: centralData,
+          borderColor: '#ff9f43',
+          backgroundColor: 'transparent',
+          pointRadius: 0,
+          borderWidth: 2.5,
+          spanGaps: true,
+          tension: 0.4,
+          order: 1,
+        },
+      ],
+    },
+    options: {
+      ...baseOpts,
+      maintainAspectRatio: false,
+      scales: {
+        x: {
+          type: 'linear', min: 0, max: PITCH_WIN,
+          grid: { color: '#252540' },
+          ticks: { callback: v => `${v.toFixed(0)}s`, maxTicksLimit: 11 },
+        },
+        y: {
+          type: 'logarithmic', min: 80, max: 800,
+          grid: { color: '#252540' },
+          ticks: {
+            callback: v => {
+              const m = { 98: 'G2', 130.8: 'C3', 164.8: 'E3', 196: 'G3', 261.6: 'C4', 329.6: 'E4', 392: 'G4', 523.3: 'C5', 659.3: 'E5' };
+              for (const [f, n] of Object.entries(m))
+                if (Math.abs(v - +f) < +f * 0.025) return n;
+              return '';
+            },
+          },
+        },
+      },
+    },
+  });
+
+  const vibChart = new Chart(document.getElementById('vibChart'), {
+    type: 'line',
+    data: {
+      datasets: [{
+        data: vibData,
+        borderColor: '#a29bfe',
+        backgroundColor: '#a29bfe20',
+        fill: true,
+        pointRadius: 0,
+        borderWidth: 1.5,
+        spanGaps: false,
+        tension: 0.3,
+      }],
+    },
+    options: {
+      ...baseOpts,
+      maintainAspectRatio: false,
+      scales: {
+        x: {
+          type: 'linear', min: 0, max: VIB_WIN,
+          grid: { color: '#252540' },
+          ticks: { display: false },
+        },
+        y: {
+          min: -60, max: 60,
+          grid: { color: '#252540' },
+          ticks: { callback: v => v === 0 ? '0' : `${v}¢`, maxTicksLimit: 5 },
+        },
+      },
+    },
+  });
+
+  // ── Tuner needle ────────────────────────────────────────────────────
+  function updateTuner(etDevCents, etNote, accuracyPct, voiced) {
+    const needle   = document.getElementById('tunerNeedle');
+    const noteEl   = document.getElementById('noteDisplay');
+    const devEl    = document.getElementById('etDevText');
+    const accEl    = document.getElementById('accuracyVal');
+
+    noteEl.textContent = voiced ? etNote : '—';
+
+    if (voiced) {
+      const pct    = Math.max(0, Math.min(100, (etDevCents + 50) / 100 * 100));
+      needle.style.left = `${pct}%`;
+
+      const sign   = etDevCents > 0 ? '+' : '';
+      devEl.textContent = `${sign}${etDevCents.toFixed(1)} ¢`;
+      devEl.className   = 'et-dev ' + (Math.abs(etDevCents) < 10 ? 'good' : Math.abs(etDevCents) < 25 ? 'warn' : 'bad');
+    } else {
+      needle.style.left = '50%';
+      devEl.textContent = '—';
+      devEl.className   = 'et-dev dim';
+    }
+
+    if (accuracyPct > 0) {
+      accEl.textContent = `${accuracyPct.toFixed(0)}%`;
+      accEl.className   = 'accuracy-val ' + (accuracyPct >= 80 ? 'good' : accuracyPct >= 60 ? 'warn' : 'bad');
+    }
+  }
+
+  // ── Stats panel ─────────────────────────────────────────────────────
+  function cls(el, c) { el.className = el.className.replace(/\b(good|warn|bad|dim)\b/g, '').trim() + ' ' + c; }
+
+  function updateStats(s, voiced) {
+    const dynEl  = document.getElementById('dynVal');
+    const dbfsEl = document.getElementById('dbfsVal');
+    const cppEl  = document.getElementById('cppVal');
+    const cppLbl = document.getElementById('cppLbl');
+    const vadEl  = document.getElementById('vadVal');
+    const vadLbl = document.getElementById('vadLbl');
+
+    dynEl.textContent  = (s.dynamic === 'silent') ? '—' : s.dynamic;
+    dbfsEl.textContent = `${s.dbfs} dBFS`;
+    cls(dynEl, s.dynamic === 'silent' ? 'stat-val dim' : 'stat-val good');
+
+    const cpp = s.cpp;
+    cppEl.textContent = `${cpp.toFixed(1)} dB`;
+    if      (cpp > 15) { cppLbl.textContent = 'Clear voice';      cls(cppEl, 'stat-val good'); }
+    else if (cpp > 8)  { cppLbl.textContent = 'Some breathiness'; cls(cppEl, 'stat-val warn'); }
+    else               { cppLbl.textContent = 'Breathy';          cls(cppEl, 'stat-val bad');  }
+
+    if (voiced && s.et_note !== '—') {
+      vadEl.textContent  = 'Voiced';
+      vadLbl.textContent = `${s.et_note}  (${s.et_dev_cents > 0 ? '+' : ''}${s.et_dev_cents.toFixed(1)}¢)`;
+      cls(vadEl, 'stat-val good');
+    } else {
+      vadEl.textContent  = 'Silent';
+      vadLbl.textContent = '—';
+      cls(vadEl, 'stat-val dim');
+    }
+  }
+
+  // ── Feedback ────────────────────────────────────────────────────────
+  function getFeedback(s, voiced) {
+    if (!voiced) return 'Sing something to see feedback.';
+    const p    = [];
+    const dev  = s.et_dev_cents;
+    const acc  = s.accuracy_pct;
+
+    if      (Math.abs(dev) < 10) p.push('In tune ✓');
+    else if (dev < -25)          p.push(`Flat by ${Math.abs(dev).toFixed(0)}¢ — push up`);
+    else if (dev < -10)          p.push(`Slightly flat (${Math.abs(dev).toFixed(0)}¢ ↓)`);
+    else if (dev >  25)          p.push(`Sharp by ${dev.toFixed(0)}¢ — ease back`);
+    else                         p.push(`Slightly sharp (${dev.toFixed(0)}¢ ↑)`);
+
+    if (acc > 0) p.push(`${acc.toFixed(0)}% pitch accuracy`);
+    if (s.cpp > 15)    p.push('Clear voice ✓');
+    else if (s.cpp > 8) p.push('Some breathiness — engage support');
+    else               p.push('Breathy — support your breath');
+    if (s.dynamic && s.dynamic !== 'silent') p.push(`Dynamic: ${s.dynamic}`);
+
+    return p.join('  ·  ');
+  }
+
+  // ── Timer ────────────────────────────────────────────────────────────
+  setInterval(() => {
+    if (!startTs) return;
+    const s  = Math.floor((Date.now() - startTs) / 1000);
+    document.getElementById('timer').textContent =
+      `${String(Math.floor(s/60)).padStart(2,'0')}:${String(s%60).padStart(2,'0')}`;
+  }, 500);
+
+  // ── WebSocket ────────────────────────────────────────────────────────
+  let ws = null;
+  let nativeSR = 44100;
+
+  function connectWS(onOpen) {
+    ws = new WebSocket(`ws://${location.host}/ws`);
+    const connEl = document.getElementById('connEl');
+
+    ws.onopen = () => {
+      connEl.textContent = 'Connected';
+      connEl.className   = 'conn ok';
+      ws.send(JSON.stringify({ sr: nativeSR }));
+      if (onOpen) onOpen();
+    };
+    ws.onclose = () => {
+      connEl.textContent = 'Reconnecting…';
+      connEl.className   = 'conn';
+      setTimeout(() => connectWS(), 1500);
+    };
+    ws.onerror = () => ws.close();
+
+    ws.onmessage = (evt) => {
+      const msg = JSON.parse(evt.data);
+      const s   = msg.summary;
+
+      let voiced = false;
+      msg.frames.forEach(f => {
+        pitchData.push({ x: f.t, y: f.f0 });
+        centralData.push({ x: f.t, y: f.central });   // per-frame, not stale summary
+        vibData.push({ x: f.t, y: f.vib });
+        if (f.t > latestT) latestT = f.t;
+        if (f.f0 !== null) voiced = true;
+      });
+
+      // Trim old data
+      const pMin = latestT - PITCH_WIN, vMin = latestT - VIB_WIN;
+      while (pitchData.length   && pitchData[0].x   < pMin) pitchData.shift();
+      while (centralData.length && centralData[0].x < pMin) centralData.shift();
+      while (vibData.length     && vibData[0].x     < vMin) vibData.shift();
+
+      // Scroll axes
+      pitchChart.options.scales.x.min = Math.max(0, latestT - PITCH_WIN);
+      pitchChart.options.scales.x.max = Math.max(latestT, PITCH_WIN);
+      vibChart.options.scales.x.min   = Math.max(0, latestT - VIB_WIN);
+      vibChart.options.scales.x.max   = Math.max(latestT, VIB_WIN);
+      pitchChart.update('none');
+      vibChart.update('none');
+
+      updateTuner(s.et_dev_cents, s.et_note, s.accuracy_pct, voiced);
+      updateStats(s, voiced);
+      document.getElementById('feedbackText').textContent = getFeedback(s, voiced);
+    };
+
+    setInterval(() => { if (ws && ws.readyState === WebSocket.OPEN) ws.send('ping'); }, 8000);
+  }
+
+  // ── Mic start ────────────────────────────────────────────────────────
+  document.getElementById('startBtn').addEventListener('click', async () => {
+    const errEl = document.getElementById('overlayError');
+    const btn   = document.getElementById('startBtn');
+    btn.textContent = 'Requesting mic…';
+    btn.disabled    = true;
+    errEl.style.display = 'none';
+
+    try {
+      const stream   = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }, video: false });
+      const audioCtx = new AudioContext();
+      nativeSR       = audioCtx.sampleRate;
+
+      connectWS(() => {
+        // Mic → ScriptProcessor → WebSocket
+        const source = audioCtx.createMediaStreamSource(stream);
+        const proc   = audioCtx.createScriptProcessor(1024, 1, 1);  // 23 ms at 44.1 kHz
+        source.connect(proc);
+        proc.connect(audioCtx.destination);
+
+        proc.onaudioprocess = (e) => {
+          if (!ws || ws.readyState !== WebSocket.OPEN) return;
+          ws.send(new Float32Array(e.inputBuffer.getChannelData(0)).buffer);
+        };
+
+        // Re-send SR on every reconnect
+        const origOnOpen = ws.onopen.bind(ws);
+        ws.onopen = (...a) => { origOnOpen(...a); ws.send(JSON.stringify({ sr: nativeSR })); };
+      });
+
+      if (!startTs) startTs = Date.now();
+      document.getElementById('overlay').style.display = 'none';
+
+    } catch (err) {
+      errEl.textContent   = `Mic error: ${err.message}`;
+      errEl.style.display = 'block';
+      btn.textContent     = '🎤 Start Listening';
+      btn.disabled        = false;
+    }
+  });
+</script>
+</body>
+</html>
