@@ -14,8 +14,8 @@ import numpy as np
 from scipy import signal
 
 
-VIBRATO_FREQ_MIN = 4.5   # Hz — below this is slow wobble / drift
-VIBRATO_FREQ_MAX = 8.0   # Hz — above this is flutter / tremolo
+VIBRATO_FREQ_MIN = 3.0   # Hz — below this is slow wobble / drift
+VIBRATO_FREQ_MAX = 9.0   # Hz — above this is flutter / tremolo
 
 
 def compute_vibrato_deviation(
@@ -48,37 +48,26 @@ def compute_vibrato_deviation(
 
 def bandpass_vibrato(
     f0_hz: np.ndarray,
+    central_hz: np.ndarray | None = None,
     frame_rate_hz: float = 100.0,
     freq_min: float = VIBRATO_FREQ_MIN,
     freq_max: float = VIBRATO_FREQ_MAX,
 ) -> np.ndarray:
-    """Isolate the vibrato component of an f0 track via band-pass filtering.
-
-    Converts f0 to cents, fills gaps, then applies a band-pass Butterworth
-    filter to keep only the vibrato frequency range.
-
-    Args:
-        f0_hz:         (T,) f0 in Hz from NanoPitch (0 = unvoiced)
-        frame_rate_hz: frames per second (default 100 = 10 ms hop)
-        freq_min:      lower vibrato cutoff in Hz
-        freq_max:      upper vibrato cutoff in Hz
-
-    Returns:
-        vibrato_cents: (T,) float32 — filtered vibrato oscillation in cents
-                        (NaN where the original f0 was unvoiced)
-    """
+    """Isolate vibrato as cents above/below central pitch, band-passed in rate."""
+    f0_hz = np.asarray(f0_hz, dtype=np.float64)
     voiced = f0_hz > 0
     if voiced.sum() < 10:
         return np.full(len(f0_hz), np.nan, dtype=np.float32)
 
-    # Work in cents for perceptual uniformity
-    cents = np.full(len(f0_hz), np.nan, dtype=np.float64)
-    cents[voiced] = 1200.0 * np.log2(f0_hz[voiced] / 440.0)
+    if central_hz is not None:
+        central_hz = np.asarray(central_hz, dtype=np.float64)
+        dev = compute_vibrato_deviation(f0_hz.astype(np.float32), central_hz.astype(np.float32))
+        signal_in = _fill_nan_linear(dev.astype(np.float64))
+    else:
+        cents = np.full(len(f0_hz), np.nan, dtype=np.float64)
+        cents[voiced] = 1200.0 * np.log2(f0_hz[voiced] / 440.0)
+        signal_in = _fill_nan_linear(cents)
 
-    # Fill unvoiced gaps for filtering (linear interpolation)
-    cents_filled = _fill_nan_linear(cents)
-
-    # Band-pass filter in the vibrato range
     nyq = frame_rate_hz / 2.0
     lo = freq_min / nyq
     hi = min(freq_max / nyq, 0.99)
@@ -87,9 +76,8 @@ def bandpass_vibrato(
         return np.full(len(f0_hz), np.nan, dtype=np.float32)
 
     sos = signal.butter(4, [lo, hi], btype='bandpass', output='sos')
-    filtered = signal.sosfiltfilt(sos, cents_filled)
+    filtered = signal.sosfiltfilt(sos, signal_in)
 
-    # Mask back out the unvoiced regions
     result = np.where(voiced, filtered, np.nan)
     return result.astype(np.float32)
 

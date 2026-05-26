@@ -3,9 +3,9 @@
 Audio is captured in the BROWSER via the Web Audio API and streamed
 as raw Float32 PCM over WebSocket.
 
-Pitch: trained NanoPitch GRU model (runs/exp1/checkpoints/best.pth).
-       Inference runs on a 128 ms rolling window for low latency.
-       Falls back to random weights with a warning if no checkpoint is found.
+Pitch: trained NanoPitch GRU model + gesture-aware scoring.
+       Steady frames are scored for ET accuracy; vibrato/glissando/transition
+       frames use widened Viterbi transitions and are excluded from accuracy.
 
 Run:  python3 app.py
 Open: http://localhost:8000
@@ -25,64 +25,141 @@ import torch
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
-from scipy.signal import medfilt, savgol_filter
+from scipy.signal import savgol_filter
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from features.pitch.nanopitch import NanoPitchExtractor, _compute_mel
+from features.pitch.gesture import (
+    GESTURE_STEADY,
+    classify_gestures_live,
+    gesture_name,
+    is_scored_gesture,
+    merge_gesture_predictions,
+    overlay_vibrato_from_deviation,
+    provisional_f0_from_posteriors,
+    smooth_gesture_label,
+)
+from features.pitch.nanopitch import (
+    NanoPitchExtractor, _mel_frame_from_segment,
+    HOP_LENGTH as NP_HOP, WIN_LENGTH as NP_WIN, NC_CONV_CONTEXT, MEL_MIN_TAIL,
+)
 from features.pitch.central_pitch import compute_central_pitch
 from features.dynamics.dynamic_class import classify_dynamic
 from features.breath.cpp import compute_cpp
 from features.breath.spectral_tilt import compute_spectral_tilt_slope
 from features.vibrato.bandpass import bandpass_vibrato
-from model.nanopitch import bin_to_f0
+from model.nanopitch import viterbi_stream_gesture
 
 # ── Constants ──────────────────────────────────────────────────────────
 SR             = 16_000
-HOP_LENGTH     = 160          # 10 ms per NanoPitch frame at 16 kHz
-MODEL_WIN      = 1600         # 100 ms context window fed to NanoPitch (10 frames)
+HOP_LENGTH     = NP_HOP          # 160 — 10 ms per NanoPitch frame at 16 kHz
+WIN_LENGTH     = NP_WIN          # 400 — 25 ms analysis window
 ROLLING_SECS   = 3
 ROLLING_SAMPS  = SR * ROLLING_SECS    # 48 000
 ROLLING_FRAMES = ROLLING_SECS * 100   # 300
 
-MIN_AUDIO_SAMPS = MODEL_WIN   # need this many samples before first pitch estimate
+MIN_AUDIO_SAMPS = NP_WIN            # 400 samples = first mel frame
 MIN_VIB_FRAMES  = 120
-ACCURACY_WIN    = 300
-ET_TUNE_CENTS   = 25.0
-
 # How often to run the slower DSP operations (in chunks)
 CPP_EVERY   = 15   # every ~15 chunks ≈ 350 ms
-VIB_EVERY   = 50   # every ~50 chunks ≈ 1.1 s
+VIB_EVERY   = 15   # every ~15 chunks ≈ 350 ms
 
 app = FastAPI()
 
 # ── Model — loaded once at startup ────────────────────────────────────
-CHECKPOINT = Path(__file__).parent / "runs" / "exp1" / "checkpoints" / "best.pth"
+# Checkpoint search order: env var, local IRIS training run, NanoPitchFork sibling
+NANOPITCH_CHECKPOINT_CANDIDATES = [
+    Path(__file__).parent.parent / "NanoPitchFork" / "training" / "runs" / "exp6" / "checkpoints" / "best.pth",
+    Path(__file__).parent / "runs" / "exp1" / "checkpoints" / "best.pth",
+    Path(__file__).parent.parent / "NanoPitchFork" / "training" / "runs" / "exp4-cosine-logits" / "checkpoints" / "best.pth",
+]
+NANOPITCH_PLUS_CANDIDATES = [
+    Path(__file__).parent / "runs" / "vocalset_plus" / "checkpoints" / "best.pth",
+]
 _extractor: NanoPitchExtractor | None = None
+_checkpoint_used: Path | None = None
+_gesture_source: str = "heuristic"  # heuristic | model
 
 
-def _load_and_warmup(local: str | None) -> NanoPitchExtractor:
-    """Load model and run a dummy forward pass to trigger any JIT compilation."""
-    ext = NanoPitchExtractor.from_pretrained(local_path=local)
-    # Warmup: first PyTorch call is slow (internal setup, numba, etc.)
-    dummy_mel  = np.zeros((MODEL_WIN,), dtype=np.float32)
-    dummy_feat = _compute_mel(dummy_mel, sr=SR)
-    dummy_t    = torch.from_numpy(dummy_feat).unsqueeze(0)
+def _resolve_plus_checkpoint() -> Path | None:
+    import os
+    env = os.environ.get("NANOPITCH_PLUS_CHECKPOINT")
+    if env:
+        p = Path(env).expanduser()
+        return p if p.exists() else None
+    for p in NANOPITCH_PLUS_CANDIDATES:
+        if p.exists():
+            return p
+    return None
+
+
+def _resolve_checkpoint() -> Path | None:
+    import os
+    env = os.environ.get("NANOPITCH_CHECKPOINT")
+    if env:
+        p = Path(env).expanduser()
+        if p.exists():
+            return p
+        print(f"[WARNING] NANOPITCH_CHECKPOINT not found: {p}")
+    for p in NANOPITCH_CHECKPOINT_CANDIDATES:
+        if p.exists():
+            return p
+    return None
+
+
+def _load_and_warmup(pitch_ckpt: str | None, plus_ckpt: str | None) -> NanoPitchExtractor:
+    """Load pitch model; optionally replace with NanoPitchPlus for gesture head."""
+    global _gesture_source
+    if plus_ckpt:
+        ext = NanoPitchExtractor.from_checkpoint(plus_ckpt, prefer_plus=True)
+        _gesture_source = "model"
+    elif pitch_ckpt:
+        ext = NanoPitchExtractor.from_checkpoint(pitch_ckpt)
+        _gesture_source = "heuristic"
+    else:
+        ext = NanoPitchExtractor.from_pretrained(local_path=None)
+        _gesture_source = "heuristic"
+
+    state = ext.model.init_streaming_state()
+    dummy_buf = np.zeros(MEL_MIN_TAIL, dtype=np.float32)
     with torch.no_grad():
-        ext.model(dummy_t)
+        for _ in range(NC_CONV_CONTEXT + 1):
+            mf = _mel_frame_from_segment(dummy_buf)
+            frame_t = torch.from_numpy(mf).unsqueeze(0).unsqueeze(0)
+            ext.model.forward_single_frame(frame_t, state)
     return ext
 
 
 @app.on_event("startup")
 async def _startup() -> None:
-    global _extractor
-    local = str(CHECKPOINT) if CHECKPOINT.exists() else None
-    _extractor = await asyncio.to_thread(_load_and_warmup, local)
-    source = f"trained checkpoint ({CHECKPOINT})" if CHECKPOINT.exists() else "random weights"
-    print(f"NanoPitch ready — {source}")
+    global _extractor, _checkpoint_used
+    plus_ckpt = _resolve_plus_checkpoint()
+    pitch_ckpt = _resolve_checkpoint()
+    if plus_ckpt:
+        _checkpoint_used = plus_ckpt
+        _extractor = await asyncio.to_thread(
+            _load_and_warmup, None, str(plus_ckpt),
+        )
+        print(f"NanoPitchPlus ready — {plus_ckpt} (gesture head: model)")
+    elif pitch_ckpt:
+        _checkpoint_used = pitch_ckpt
+        _extractor = await asyncio.to_thread(
+            _load_and_warmup, str(pitch_ckpt), None,
+        )
+        print(f"NanoPitch ready — {pitch_ckpt} (gesture: heuristic f0)")
+    else:
+        _extractor = await asyncio.to_thread(_load_and_warmup, None, None)
+        print("NanoPitch ready — random weights (gesture: heuristic f0)")
 
 
 _NOTE_NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B']
+
+def _buf_index(buf_len: int, samples_rx: int, abs_sample: int) -> int:
+    """Map absolute sample index to index in the rolling buffer."""
+    if samples_rx <= buf_len:
+        return (buf_len - samples_rx) + abs_sample
+    return abs_sample - (samples_rx - buf_len)
+
 
 def _hz_to_et(hz: float) -> tuple[float, str, float]:
     if hz <= 0:
@@ -105,10 +182,11 @@ def _hz_to_et(hz: float) -> tuple[float, str, float]:
 class ClientState:
     audio_roll:      np.ndarray = field(default_factory=lambda: np.zeros(ROLLING_SAMPS, dtype=np.float32))
     f0_history:      deque      = field(default_factory=lambda: deque(maxlen=ROLLING_FRAMES))
-    et_accuracy:     deque      = field(default_factory=lambda: deque(maxlen=ACCURACY_WIN))
+    raw_f0_history:  deque      = field(default_factory=lambda: deque(maxlen=ROLLING_FRAMES))
+    gesture_history: deque      = field(default_factory=lambda: deque(maxlen=ROLLING_FRAMES))
     samples_rx:      int        = 0
     elapsed:         float      = 0.0
-    client_sr:       int        = 44100
+    client_sr:       int        = 16000
     chunk_n:         int        = 0
     # cached slow-DSP results (updated every N chunks)
     last_cpp:        float      = 0.0
@@ -116,8 +194,10 @@ class ClientState:
     last_dbfs:       float      = -80.0
     last_dynamic:    str        = "silent"
     cached_vib:      np.ndarray = field(default_factory=lambda: np.zeros(1, dtype=np.float32))
-    # GRU hidden states carried across chunks for continuous temporal context
-    gru_states:      list | None = field(default=None)
+    sample_pending:  np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
+    model_frame_n:   int        = 0
+    streaming_state: dict | None = field(default=None)
+    viterbi_state:   np.ndarray | None = field(default=None)
 
 
 # ── Feature extraction ─────────────────────────────────────────────────
@@ -131,7 +211,6 @@ def _extract(state: ClientState, chunk: np.ndarray,
     """
     buf = audio_snap if audio_snap is not None else state.audio_roll
     hop_s  = HOP_LENGTH / SR
-    n_new  = max(1, len(chunk) // HOP_LENGTH)
     state.chunk_n += 1
 
     # ── Energy / dynamics ────────────────────────────────────────────
@@ -141,54 +220,99 @@ def _extract(state: ClientState, chunk: np.ndarray,
     state.last_dbfs    = dbfs
     state.last_dynamic = classify_dynamic(dbfs) or "silent"
 
-    # ── Pitch — NanoPitch (sole detector) ───────────────────────────
-    # The model has its own Viterbi-based voicing detector; no RMS gate needed.
-    # It naturally outputs 0 on silence.  We only wait until the rolling buffer
-    # has enough audio for the first mel window.
-    f0_arr = np.zeros(n_new, dtype=np.float32)
+    # ── Pitch — streaming NanoPitch + gesture-aware Viterbi ─────────
+    f0_arr = np.zeros(0, dtype=np.float32)
+    gesture_arr = np.zeros(0, dtype=np.int8)
 
     if state.samples_rx >= MIN_AUDIO_SAMPS and _extractor is not None:
-        model_win = buf[-MODEL_WIN:].copy()
         try:
-            mel   = _compute_mel(model_win, sr=SR)
-            mel_t = torch.from_numpy(mel).unsqueeze(0)
+            if state.streaming_state is None:
+                state.streaming_state = _extractor.model.init_streaming_state()
 
-            with torch.no_grad():
-                vad_out, pitch_out, new_gru = _extractor.model(
-                    mel_t, states=state.gru_states
+            pending = (
+                np.concatenate([state.sample_pending, chunk])
+                if len(state.sample_pending) else chunk
+            )
+            n_hops = len(pending) // HOP_LENGTH
+            state.sample_pending = pending[n_hops * HOP_LENGTH:].copy()
+
+            base_abs = state.samples_rx - len(pending)
+
+            posteriors: list[np.ndarray] = []
+            gesture_logits: list[np.ndarray] = []
+            frame_ids: list[int] = []
+            for i in range(n_hops):
+                hop_end = base_abs + (i + 1) * HOP_LENGTH
+                if hop_end < WIN_LENGTH:
+                    continue
+                frame_idx = (hop_end - WIN_LENGTH) // HOP_LENGTH
+                abs_start = frame_idx * HOP_LENGTH
+                if state.samples_rx < abs_start + MEL_MIN_TAIL:
+                    continue
+                pos = _buf_index(len(buf), state.samples_rx, abs_start)
+                mel_frame = _mel_frame_from_segment(buf[pos:])
+                frame_t = torch.from_numpy(mel_frame).unsqueeze(0).unsqueeze(0)
+                with torch.no_grad():
+                    if _extractor.has_gesture_head:
+                        _, pitch_f, gest_l, _, _, state.streaming_state = \
+                            _extractor.model.forward_single_frame(
+                                frame_t, state.streaming_state)
+                        gesture_logits.append(gest_l[0, 0].cpu().numpy())
+                    else:
+                        _, pitch_f, state.streaming_state = \
+                            _extractor.model.forward_single_frame(
+                                frame_t, state.streaming_state)
+                state.model_frame_n += 1
+                posteriors.append(pitch_f[0, 0].cpu().numpy())
+                frame_ids.append(state.model_frame_n)
+
+            if posteriors:
+                post = np.stack(posteriors)
+
+                # Gesture from raw argmax f0 (pre-Viterbi) — keeps vibrato modulation.
+                prov = provisional_f0_from_posteriors(post)
+                for pf in prov:
+                    state.raw_f0_history.append(float(pf))
+                raw_track = np.array(list(state.raw_f0_history), dtype=np.float32)
+                heuristic_gest = classify_gestures_live(raw_track)[-len(prov):]
+
+                if gesture_logits:
+                    gest_arr = merge_gesture_predictions(
+                        heuristic_gest,
+                        np.stack(gesture_logits),
+                    )
+                else:
+                    gest_arr = heuristic_gest
+
+                f0_raw, state.viterbi_state = viterbi_stream_gesture(
+                    post, gest_arr, state.viterbi_state,
                 )
-            state.gru_states = new_gru
+                for i, frame_n in enumerate(frame_ids):
+                    if frame_n <= NC_CONV_CONTEXT:
+                        f0_raw[i] = 0.0
+                f0_arr = f0_raw.astype(np.float32)
 
-            # ── Decode pitch ────────────────────────────────────────
-            # Strategy: greedy argmax for the pitch bin (avoids the
-            # "stuck-in-unvoiced" failure mode of Viterbi cold-start),
-            # then gate voiced/unvoiced using the model's own VAD head
-            # (trained explicitly for this binary decision) plus a
-            # minimum-confidence check on the pitch posterior.
-            post          = pitch_out[0].cpu().numpy()       # (T, 360)
-            vad_probs     = vad_out[0, :, 0].cpu().numpy()  # (T,)
-            max_post_frame = post.max(axis=1)                # (T,)
-            pitch_bins    = post.argmax(axis=1)              # (T,)
-            f0_greedy     = bin_to_f0(pitch_bins.astype(np.float64)).astype(np.float32)
-
-            # Voiced if VAD head is confident OR the pitch peak is clear.
-            # Using OR makes the detector more sensitive — either head can
-            # trigger voiced, reducing missed detections.
-            voiced_mask = (vad_probs > 0.2) | (max_post_frame > 0.15)
-            f0_raw = np.where(voiced_mask, f0_greedy, 0.0)
-            f0_raw = np.where((f0_raw >= 55) & (f0_raw <= 2093), f0_raw, 0.0)
-
-            if len(f0_raw) >= n_new:
-                f0_arr = f0_raw[-n_new:].astype(np.float32)
+                # Keep gesture labels from raw-track heuristics (+ model), not Viterbi f0.
+                gesture_arr = gest_arr.astype(np.int8)
+            else:
+                gesture_arr = np.zeros(0, dtype=np.int8)
         except Exception as exc:
+            import traceback
             print(f"  [NanoPitch inference error] {exc}")
+            traceback.print_exc()
 
-        if len(f0_arr) >= 3:
-            f0_arr = medfilt(f0_arr, kernel_size=3).astype(np.float32)
+    n_new = len(f0_arr) if len(f0_arr) else max(1, len(chunk) // HOP_LENGTH)
+    if len(f0_arr) == 0:
+        f0_arr = np.zeros(n_new, dtype=np.float32)
+    if len(gesture_arr) == 0:
+        gesture_arr = np.full(n_new, GESTURE_STEADY, dtype=np.int8)
+    elif len(gesture_arr) != n_new:
+        gesture_arr = np.resize(gesture_arr, n_new)
 
-    # ── Update rolling f0 history ─────────────────────────────────
-    for f in f0_arr:
+    # ── Update rolling f0 + gesture history ───────────────────────
+    for f, g in zip(f0_arr, gesture_arr):
         state.f0_history.append(float(f))
+        state.gesture_history.append(int(g))
 
     # ── Central pitch (per-frame) ──────────────────────────────────
     f0_roll     = np.array(list(state.f0_history), dtype=np.float32)
@@ -210,14 +334,14 @@ def _extract(state: ClientState, chunk: np.ndarray,
         voiced_count = int((f0_roll > 0).sum())
         if voiced_count >= MIN_VIB_FRAMES:
             try:
-                vib_full = bandpass_vibrato(f0_roll, frame_rate_hz=100.0)
+                vib_full = bandpass_vibrato(
+                    f0_roll, central_hz=central_arr, frame_rate_hz=100.0,
+                )
                 valid    = ~np.isnan(vib_full)
                 if valid.sum() > 20:
                     win = min(21, max(5, (valid.sum() // 4) * 2 + 1))
                     vib_full[valid] = savgol_filter(vib_full[valid], win, 3)
-                state.cached_vib = np.clip(
-                    np.nan_to_num(vib_full, nan=0.0), -80, 80
-                ).astype(np.float32)
+                state.cached_vib = np.clip(vib_full, -80, 80).astype(np.float32)
             except Exception:
                 pass
         else:
@@ -229,25 +353,41 @@ def _extract(state: ClientState, chunk: np.ndarray,
         else np.zeros(n_new, dtype=np.float32)
     )
 
-    # ── ET deviation + accuracy ────────────────────────────────────
+    # Align gesture labels with vibrato deviation chart (same band-pass signal).
+    if len(vib_latest) and np.any(f0_arr > 0):
+        gesture_arr = overlay_vibrato_from_deviation(
+            gesture_arr, f0_arr, vib_latest,
+        ).astype(np.int8)
+        if n_new > 0 and len(state.gesture_history) >= n_new:
+            hist = list(state.gesture_history)
+            for i in range(n_new):
+                hist[-n_new + i] = int(gesture_arr[i])
+            state.gesture_history = deque(hist, maxlen=ROLLING_FRAMES)
+
+    # ── ET deviation + gesture display ───────────────────────────────
     f0_now              = float(f0_arr[-1]) if len(f0_arr) and f0_arr[-1] > 0 else 0.0
-    et_hz, et_note, et_dev = _hz_to_et(f0_now)
-    if f0_now > 0:
-        state.et_accuracy.append(abs(et_dev) <= ET_TUNE_CENTS)
-    accuracy_pct = (
-        100.0 * sum(state.et_accuracy) / len(state.et_accuracy)
-        if state.et_accuracy else 0.0
+    gesture_now         = int(gesture_arr[-1]) if len(gesture_arr) else GESTURE_STEADY
+    vib_display_win     = min(45, len(state.cached_vib))
+    gesture_display     = smooth_gesture_label(
+        np.array(list(state.gesture_history)[-vib_display_win:], dtype=np.int8),
+        vib_recent=state.cached_vib[-vib_display_win:],
     )
+    _, et_note, et_dev = _hz_to_et(f0_now)
 
     # ── Build per-frame list ───────────────────────────────────────
     frames = []
     for i, f in enumerate(f0_arr):
         c = float(central_latest[i]) if i < len(central_latest) and not np.isnan(central_latest[i]) else None
+        g = int(gesture_arr[i]) if i < len(gesture_arr) else GESTURE_STEADY
+        vi = float(vib_latest[i]) if i < len(vib_latest) else np.nan
         frames.append({
             "t":       round(state.elapsed - (n_new - i - 1) * hop_s, 3),
             "f0":      round(float(f), 2)  if float(f) > 0     else None,
             "central": round(c, 2)          if c and c > 0      else None,
-            "vib":     round(float(vib_latest[i]) if i < len(vib_latest) else 0.0, 2),
+            "vib":     round(vi, 2)
+                       if float(f) > 0 and not np.isnan(vi) else None,
+            "gesture": gesture_name(g),
+            "scored":  is_scored_gesture(g),
         })
 
     return {
@@ -259,7 +399,9 @@ def _extract(state: ClientState, chunk: np.ndarray,
             "tilt":         round(state.last_tilt, 1),
             "et_note":      et_note,
             "et_dev_cents": round(et_dev, 1),
-            "accuracy_pct": round(accuracy_pct, 1),
+            "gesture":      gesture_name(gesture_display),
+            "gesture_raw":  gesture_name(gesture_now),
+            "gesture_source": _gesture_source,
         },
     }
 
@@ -282,7 +424,8 @@ async def ws_endpoint(ws: WebSocket) -> None:
             return None
         chunk = (
             librosa.resample(chunk_raw, orig_sr=state.client_sr, target_sr=SR)
-            if abs(state.client_sr - SR) > 10 else chunk_raw
+            if abs(state.client_sr - SR) > 10 and len(chunk_raw) != HOP_LENGTH
+            else chunk_raw
         )
         n = len(chunk)
         if n >= ROLLING_SAMPS:
@@ -334,9 +477,7 @@ async def ws_endpoint(ws: WebSocket) -> None:
             # before handing off to the worker thread (no race with _ingest).
             audio_snap = state.audio_roll.copy()
             try:
-                result = await asyncio.to_thread(
-                    _extract, state, chunk, audio_snap
-                )
+                result = await asyncio.to_thread(_extract, state, chunk, audio_snap)
                 await ws.send_text(json.dumps(result))
             except WebSocketDisconnect:
                 break
@@ -361,7 +502,9 @@ async def ws_endpoint(ws: WebSocket) -> None:
 
 @app.get("/")
 async def index() -> FileResponse:
-    return FileResponse(Path(__file__).parent / "index.html")
+    resp = FileResponse(Path(__file__).parent / "index.html")
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 if __name__ == "__main__":

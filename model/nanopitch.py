@@ -245,6 +245,71 @@ def viterbi_decode(posteriorgram, transition_width=12, voicing_threshold=0.3,
     return f0_hz
 
 
+def viterbi_stream(posteriorgram, state=None,
+                   transition_width=12, voicing_threshold=0.3, onset_penalty=2.0):
+    """Streaming Viterbi for continuous real-time inference across chunk boundaries.
+
+    Identical transition model to viterbi_decode_realtime, but accepts and returns
+    the prev-score vector so state persists across calls. This is the correct way
+    to run Viterbi when audio arrives in chunks rather than as a complete sequence —
+    it matches the C/WASM deployment exactly at chunk boundaries.
+
+    Args:
+        posteriorgram: (T, 360) pitch probabilities for the current chunk
+        state:         (361,) float64 prev-score vector from the previous call,
+                       or None to initialize fresh on the first chunk.
+        transition_width, voicing_threshold, onset_penalty:
+                       same semantics as viterbi_decode_realtime
+
+    Returns:
+        f0_hz: (T,) float32 decoded f0 in Hz (0 = unvoiced)
+        state: (361,) float64 prev-score vector to pass into the next call
+    """
+    import numpy as np
+
+    T, N = posteriorgram.shape
+    if T == 0:
+        s = state if state is not None else np.full(N + 1, -10.0, dtype=np.float64)
+        return np.zeros(0, dtype=np.float32), s
+
+    tw = int(transition_width)
+    W = 2 * tw + 1
+
+    # Match NanoPitch C exactly: initialise all states to -10.0, not -inf.
+    # The C code does: st->viterbi_prev[i] = -10.0f  (for all N+1 states).
+    # A voicing_threshold gate on frame 0 traps the tracker in all-unvoiced
+    # (-inf) and it can never recover; the flat -10.0 prior lets the
+    # observation model decide voicing immediately on every frame.
+    prev = state if state is not None else np.full(N + 1, -10.0, dtype=np.float64)
+    f0_hz = np.zeros(T, dtype=np.float32)
+
+    for t in range(T):
+        max_post_t = posteriorgram[t].max()
+        log_obs_t = np.log(posteriorgram[t] + 1e-10)
+        uv_obs = np.log(1.0 - max_post_t + 1e-10)
+
+        curr = np.full(N + 1, -np.inf, dtype=np.float64)
+
+        prev_voiced = prev[:N]
+        padded = np.pad(prev_voiced, (tw, tw), constant_values=-np.inf)
+        windows = np.lib.stride_tricks.as_strided(
+            padded, shape=(N, W),
+            strides=(padded.strides[0], padded.strides[0]))
+        best_val = np.max(windows, axis=1)
+        from_uv = prev[N] - onset_penalty
+        curr[:N] = np.maximum(best_val, from_uv) + log_obs_t
+        from_voiced = prev_voiced.max() - onset_penalty
+        curr[N] = max(prev[N], from_voiced) + uv_obs
+
+        best_state = np.argmax(curr)
+        if best_state < N:
+            f0_hz[t] = bin_to_f0(float(best_state))
+
+        prev = curr
+
+    return f0_hz, prev
+
+
 def viterbi_decode_realtime(posteriorgram, transition_width=12,
                             voicing_threshold=0.3, onset_penalty=2.0):
     """Realtime (greedy) Viterbi — matches the C/WASM deployment exactly.
@@ -471,6 +536,254 @@ class NanoPitch(nn.Module):
                 torch.zeros(1, 1, self.gru_size, device=device),
             ],
         }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# NanoPitch+ — multi-task extension for VocalSet training
+# ═══════════════════════════════════════════════════════════════════════
+
+NUM_GESTURES = 4    # steady, vibrato, glissando, transition
+NUM_REGISTERS = 4   # chest, mixed, head, falsetto
+NUM_DYNAMICS = 6    # pp … ff
+
+# Gesture indices — must match data/vocalset_labels.py
+GESTURE_STEADY = 0
+GESTURE_VIBRATO = 1
+GESTURE_GLISSANDO = 2
+GESTURE_TRANSITION = 3
+
+# Per-gesture Viterbi transition width (bins). Wider widths allow expected motion.
+GESTURE_TRANSITION_WIDTH = {
+    GESTURE_STEADY: 12,
+    GESTURE_VIBRATO: 30,
+    GESTURE_GLISSANDO: 24,
+    GESTURE_TRANSITION: 36,
+}
+
+
+class NanoPitchPlus(NanoPitch):
+    """NanoPitch with gesture, register, and dynamics heads on the 384-d concat."""
+
+    def __init__(self, n_mels=N_MELS, cond_size=64, gru_size=96):
+        super().__init__(n_mels=n_mels, cond_size=cond_size, gru_size=gru_size)
+        cat_size = gru_size * 4
+        self.dense_gesture = nn.Linear(cat_size, NUM_GESTURES)
+        self.dense_register = nn.Linear(cat_size, NUM_REGISTERS)
+        self.dense_dynamics = nn.Linear(cat_size, NUM_DYNAMICS)
+        n_params = sum(p.numel() for p in self.parameters())
+        print(f"NanoPitchPlus: {n_params:,} parameters "
+              f"(cond={cond_size}, gru={gru_size})")
+
+    def _heads(self, cat, return_logits=False):
+        vad_logits = self.dense_vad(cat)
+        pitch_logits = self.dense_pitch(cat)
+        gesture_logits = self.dense_gesture(cat)
+        register_logits = self.dense_register(cat)
+        dynamics_logits = self.dense_dynamics(cat)
+        if return_logits:
+            return vad_logits, pitch_logits, gesture_logits, register_logits, dynamics_logits
+        return (
+            torch.sigmoid(vad_logits),
+            torch.sigmoid(pitch_logits),
+            gesture_logits,
+            register_logits,
+            dynamics_logits,
+        )
+
+    def forward(self, mel, states=None, return_logits=False):
+        B = mel.size(0)
+        device = mel.device
+
+        if states is None:
+            h1 = torch.zeros(1, B, self.gru_size, device=device)
+            h2 = torch.zeros(1, B, self.gru_size, device=device)
+            h3 = torch.zeros(1, B, self.gru_size, device=device)
+        else:
+            h1, h2, h3 = states
+
+        x = mel.permute(0, 2, 1)
+        x = torch.nn.functional.pad(x, (2, 0))
+        x = torch.tanh(self.conv1(x))
+        x = torch.nn.functional.pad(x, (2, 0))
+        x = torch.tanh(self.conv2(x))
+        x = x.permute(0, 2, 1)
+
+        g1, h1 = self.gru1(x, h1)
+        g2, h2 = self.gru2(g1, h2)
+        g3, h3 = self.gru3(g2, h3)
+        cat = torch.cat([x, g1, g2, g3], dim=-1)
+
+        out = self._heads(cat, return_logits=return_logits)
+        return (*out, [h1, h2, h3])
+
+    def forward_single_frame(self, mel_frame, states, return_logits=False):
+        conv1_buf = states['conv1_buf']
+        conv2_buf = states['conv2_buf']
+        gru_states = states['gru_states']
+
+        conv1_in = torch.cat([conv1_buf, mel_frame], dim=1)
+        x = torch.tanh(self.conv1(conv1_in.permute(0, 2, 1)))
+        conv1_buf = conv1_in[:, 1:, :]
+
+        x_t = x.permute(0, 2, 1)
+        conv2_in = torch.cat([conv2_buf, x_t], dim=1)
+        x = torch.tanh(self.conv2(conv2_in.permute(0, 2, 1)))
+        conv2_buf = conv2_in[:, 1:, :]
+        x = x.permute(0, 2, 1)
+
+        h1, h2, h3 = gru_states
+        g1, h1 = self.gru1(x, h1)
+        g2, h2 = self.gru2(g1, h2)
+        g3, h3 = self.gru3(g2, h3)
+        cat = torch.cat([x, g1, g2, g3], dim=-1)
+
+        out = self._heads(cat, return_logits=return_logits)
+        new_states = {
+            'conv1_buf': conv1_buf,
+            'conv2_buf': conv2_buf,
+            'gru_states': [h1, h2, h3],
+        }
+        return (*out, new_states)
+
+    @classmethod
+    def from_nanopitch_checkpoint(cls, ckpt_path, device='cpu'):
+        """Initialise Plus heads randomly but load shared NanoPitch weights."""
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        kwargs = ckpt.get("model_kwargs", {}) if isinstance(ckpt, dict) else {}
+        model = cls(
+            cond_size=kwargs.get("cond_size", 64),
+            gru_size=kwargs.get("gru_size", 96),
+        )
+        state = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        if missing:
+            print(f"  NanoPitchPlus: loaded base weights, new heads: {missing}")
+        if unexpected:
+            print(f"  NanoPitchPlus: ignored keys: {unexpected}")
+        return model
+
+
+def viterbi_decode_gesture(
+    posteriorgram,
+    gesture_classes,
+    transition_width=12,
+    voicing_threshold=0.3,
+    onset_penalty=2.0,
+):
+    """Offline Viterbi with per-frame transition width from gesture class.
+
+    Vibrato frames use a wider transition neighbourhood; glissando and
+    transition frames allow larger pitch motion before scoring accuracy.
+    """
+    import numpy as np
+
+    T, N = posteriorgram.shape
+    if T == 0:
+        return np.zeros(0, dtype=np.float32)
+
+    gesture_classes = np.asarray(gesture_classes[:T], dtype=np.int32)
+    widths = np.array([
+        GESTURE_TRANSITION_WIDTH.get(int(g), transition_width)
+        for g in gesture_classes
+    ], dtype=np.int32)
+
+    tw_max = int(widths.max())
+    log_obs = np.log(posteriorgram + 1e-10)
+    V = np.full((T, N + 1), -np.inf, dtype=np.float64)
+    bp = np.zeros((T, N + 1), dtype=np.int32)
+
+    max_post = posteriorgram[0].max()
+    if max_post > voicing_threshold:
+        V[0, :N] = log_obs[0]
+    V[0, N] = np.log(1.0 - max_post + 1e-10)
+
+    for t in range(1, T):
+        tw = int(widths[t])
+        W = 2 * tw + 1
+        max_post_t = posteriorgram[t].max()
+        prev = V[t - 1, :N]
+
+        padded = np.pad(prev, (tw, tw), constant_values=-np.inf)
+        windows = np.lib.stride_tricks.as_strided(
+            padded, shape=(N, W),
+            strides=(padded.strides[0], padded.strides[0]))
+        best_k = np.argmax(windows, axis=1)
+        best_val = windows[np.arange(N), best_k]
+        best_from_voiced = np.clip(np.arange(N) - tw + best_k, 0, N - 1)
+
+        from_unvoiced = V[t - 1, N] - onset_penalty
+        use_voiced = best_val >= from_unvoiced
+        V[t, :N] = np.where(use_voiced, best_val, from_unvoiced) + log_obs[t]
+        bp[t, :N] = np.where(use_voiced, best_from_voiced, N)
+
+        best_voiced_score = prev.max()
+        best_voiced_idx = prev.argmax()
+        from_voiced = best_voiced_score - onset_penalty
+        stay_uv = V[t - 1, N]
+        uv_obs = np.log(1.0 - max_post_t + 1e-10)
+        if stay_uv >= from_voiced:
+            V[t, N] = stay_uv + uv_obs
+            bp[t, N] = N
+        else:
+            V[t, N] = from_voiced + uv_obs
+            bp[t, N] = best_voiced_idx
+
+    path = np.zeros(T, dtype=np.int32)
+    path[T - 1] = np.argmax(V[T - 1])
+    for t in range(T - 2, -1, -1):
+        path[t] = bp[t + 1, path[t + 1]]
+
+    f0_hz = np.zeros(T, dtype=np.float32)
+    voiced_mask = path < N
+    if voiced_mask.any():
+        f0_hz[voiced_mask] = bin_to_f0(path[voiced_mask].astype(np.float64))
+    return f0_hz
+
+
+def viterbi_stream_gesture(
+    posteriorgram,
+    gesture_classes,
+    state=None,
+    transition_width=12,
+    onset_penalty=2.0,
+):
+    """Streaming greedy Viterbi with gesture-dependent transition width."""
+    import numpy as np
+
+    T, N = posteriorgram.shape
+    if T == 0:
+        s = state if state is not None else np.full(N + 1, -10.0, dtype=np.float64)
+        return np.zeros(0, dtype=np.float32), s
+
+    gesture_classes = np.asarray(gesture_classes[:T], dtype=np.int32)
+    prev = state if state is not None else np.full(N + 1, -10.0, dtype=np.float64)
+    f0_hz = np.zeros(T, dtype=np.float32)
+
+    for t in range(T):
+        tw = int(GESTURE_TRANSITION_WIDTH.get(int(gesture_classes[t]), transition_width))
+        W = 2 * tw + 1
+        max_post_t = posteriorgram[t].max()
+        log_obs_t = np.log(posteriorgram[t] + 1e-10)
+        uv_obs = np.log(1.0 - max_post_t + 1e-10)
+        curr = np.full(N + 1, -np.inf, dtype=np.float64)
+
+        prev_voiced = prev[:N]
+        padded = np.pad(prev_voiced, (tw, tw), constant_values=-np.inf)
+        windows = np.lib.stride_tricks.as_strided(
+            padded, shape=(N, W),
+            strides=(padded.strides[0], padded.strides[0]))
+        best_val = np.max(windows, axis=1)
+        from_uv = prev[N] - onset_penalty
+        curr[:N] = np.maximum(best_val, from_uv) + log_obs_t
+        from_voiced = prev_voiced.max() - onset_penalty
+        curr[N] = max(prev[N], from_voiced) + uv_obs
+
+        best_state = np.argmax(curr)
+        if best_state < N:
+            f0_hz[t] = bin_to_f0(float(best_state))
+        prev = curr
+
+    return f0_hz, prev
 
 
 if __name__ == "__main__":

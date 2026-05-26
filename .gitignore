@@ -17,6 +17,8 @@ env/
 # Data (large files — store paths externally)
 data/raw/
 data/processed/
+data/vocalset/
+.venv_pypdf/
 *.wav
 *.mp3
 *.flac

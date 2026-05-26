@@ -13,7 +13,7 @@ import torch
 import librosa
 from pathlib import Path
 
-from model.nanopitch import NanoPitch, viterbi_decode, N_MELS, PITCH_FMIN
+from model.nanopitch import NanoPitch, NanoPitchPlus, viterbi_decode, N_MELS, PITCH_FMIN
 
 # Mel spectrogram settings that match the NanoPitch training configuration.
 # These must stay fixed — changing them would break pretrained weight compatibility.
@@ -21,8 +21,47 @@ SR = 16000
 HOP_LENGTH = 160    # 10 ms at 16 kHz
 WIN_LENGTH = 400    # 25 ms window
 N_FFT = 512
-FMIN = 50.0
-FMAX = 2000.0
+FMIN = 0.0          # HTK mel filterbank — matches nanopitch.c / PreExtract
+FMAX = 8000.0
+LOG_OFFSET = 1e-10
+NC_CONV_CONTEXT = 4  # causal conv warmup frames (matches nanopitch.h)
+MEL_MIN_TAIL = N_FFT - 32   # librosa uncentered STFT tail (480 at defaults)
+
+
+class StreamingMel:
+    """Librosa-aligned mel frames from a rolling audio buffer."""
+
+    @staticmethod
+    def frame_from_buffer(buf: np.ndarray, abs_start: int, roll_start: int) -> np.ndarray:
+        """One log-mel frame matching batch _compute_mel(center=False)."""
+        pos = abs_start - roll_start
+        if pos < 0 or pos >= len(buf):
+            raise ValueError("abs_start outside rolling buffer")
+        return _mel_frame_from_segment(buf[pos:])
+
+
+def _mel_frame_from_segment(y_seg: np.ndarray) -> np.ndarray:
+    """Match librosa batch frame 0 for segment starting at frame boundary."""
+    if len(y_seg) < N_FFT:
+        y_seg = np.pad(y_seg, (0, N_FFT - len(y_seg)))
+    mel = librosa.feature.melspectrogram(
+        y=y_seg,
+        sr=SR,
+        n_fft=N_FFT,
+        hop_length=HOP_LENGTH,
+        win_length=WIN_LENGTH,
+        n_mels=N_MELS,
+        fmin=FMIN,
+        fmax=FMAX,
+        power=2.0,
+        center=False,
+        htk=True,
+    )
+    return np.log(mel[:, 0] + LOG_OFFSET).astype(np.float32)
+
+
+def _mel_frame_from_window(window: np.ndarray) -> np.ndarray:
+    return _mel_frame_from_segment(window)
 
 
 def _compute_mel(audio: np.ndarray, sr: int = SR) -> np.ndarray:
@@ -47,12 +86,11 @@ def _compute_mel(audio: np.ndarray, sr: int = SR) -> np.ndarray:
         n_mels=N_MELS,
         fmin=FMIN,
         fmax=FMAX,
-        power=2.0,   # log-power mel — matches the NanoPitch-PreExtract training data
+        power=2.0,
+        center=False,
+        htk=True,
     )
-    # Epsilon matches NanoPitch-PreExtract: training data floor is -23.031,
-    # which equals log(1e-10).  Using 1e-7 would raise the floor to -16.1,
-    # making silence look like a weak voiced signal to the model.
-    log_mel = np.log(mel + 1e-10).T  # (frames, 40)
+    log_mel = np.log(mel + LOG_OFFSET).T  # (frames, 40)
 
     return log_mel.astype(np.float32)
 
@@ -69,6 +107,41 @@ class NanoPitchExtractor:
         self.model = model.to(device)
         self.model.eval()
         self.device = device
+
+    @property
+    def has_gesture_head(self) -> bool:
+        return isinstance(self.model, NanoPitchPlus)
+
+    @classmethod
+    def from_checkpoint(
+        cls,
+        local_path: str,
+        device: str = 'cpu',
+        prefer_plus: bool = False,
+    ) -> "NanoPitchExtractor":
+        """Load NanoPitch or NanoPitchPlus from a training checkpoint."""
+        ckpt = torch.load(local_path, map_location=device, weights_only=False)
+        if isinstance(ckpt, dict) and "state_dict" in ckpt:
+            kwargs = ckpt.get("model_kwargs", {})
+            is_plus = ckpt.get("model_type") == "NanoPitchPlus" or prefer_plus
+            if is_plus:
+                model = NanoPitchPlus(
+                    cond_size=kwargs.get("cond_size", 64),
+                    gru_size=kwargs.get("gru_size", 96),
+                )
+                model.load_state_dict(ckpt["state_dict"], strict=False)
+            else:
+                model = NanoPitch(
+                    cond_size=kwargs.get("cond_size", 64),
+                    gru_size=kwargs.get("gru_size", 96),
+                )
+                model.load_state_dict(ckpt["state_dict"])
+        else:
+            model = NanoPitchPlus() if prefer_plus else NanoPitch()
+            model.load_state_dict(ckpt)
+        kind = "NanoPitchPlus" if isinstance(model, NanoPitchPlus) else "NanoPitch"
+        print(f"Loaded {kind} weights from {local_path}")
+        return cls(model, device)
 
     @classmethod
     def from_pretrained(
@@ -94,22 +167,7 @@ class NanoPitchExtractor:
             NanoPitchExtractor ready for inference
         """
         if local_path and Path(local_path).exists():
-            ckpt = torch.load(local_path, map_location=device, weights_only=False)
-            # Training checkpoints saved by model/train.py have the format:
-            #   {"epoch": ..., "state_dict": ..., "model_kwargs": {...}, ...}
-            # Plain checkpoints are just the state_dict directly.
-            if isinstance(ckpt, dict) and "state_dict" in ckpt:
-                kwargs = ckpt.get("model_kwargs", {})
-                model = NanoPitch(
-                    cond_size=kwargs.get("cond_size", 64),
-                    gru_size=kwargs.get("gru_size", 96),
-                )
-                model.load_state_dict(ckpt["state_dict"])
-            else:
-                model = NanoPitch()
-                model.load_state_dict(ckpt)
-            print(f"Loaded NanoPitch weights from {local_path}")
-            return cls(model, device)
+            return cls.from_checkpoint(local_path, device=device)
 
         model = NanoPitch()
         try:

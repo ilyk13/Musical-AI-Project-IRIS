@@ -188,6 +188,23 @@
       display: flex; align-items: center; justify-content: space-between;
       margin-top: 6px;
     }
+    .gesture-row {
+      display: flex; align-items: center; justify-content: space-between;
+      margin-top: 4px;
+    }
+    .gesture-pill {
+      font-size: 0.72rem;
+      font-weight: 700;
+      padding: 2px 8px;
+      border-radius: 10px;
+      text-transform: capitalize;
+      background: #252540;
+      color: var(--text);
+    }
+    .gesture-pill.steady { color: var(--green); border: 1px solid #55efc440; }
+    .gesture-pill.vibrato { color: var(--purple); border: 1px solid #a29bfe40; }
+    .gesture-pill.glissando { color: var(--blue); border: 1px solid #7eb8f740; }
+    .gesture-pill.transition { color: var(--yellow); border: 1px solid #fdcb6e40; }
     .accuracy-label { font-size: 0.68rem; color: var(--dim); text-transform: uppercase; letter-spacing: 1px; }
     .accuracy-val { font-size: 1.2rem; font-weight: 700; }
     .et-dev { font-size: 0.75rem; text-align: center; margin-top: 2px; }
@@ -217,6 +234,9 @@
       border-radius: 10px;
       font-size: 0.86rem;
       color: #9999bb;
+    }
+    #feedbackText {
+      transition: opacity 0.4s ease;
     }
   </style>
 </head>
@@ -274,9 +294,9 @@
           <span>−50¢</span><span>flat</span><span>in tune</span><span>sharp</span><span>+50¢</span>
         </div>
       </div>
-      <div class="accuracy-row">
-        <span class="accuracy-label">Pitch accuracy</span>
-        <span class="accuracy-val good" id="accuracyVal">—%</span>
+      <div class="gesture-row">
+        <span class="accuracy-label">Gesture</span>
+        <span class="gesture-pill steady" id="gestureVal">steady</span>
       </div>
     </div>
 
@@ -335,14 +355,20 @@
   Chart.defaults.color       = '#555577';
   Chart.defaults.borderColor = '#252540';
 
-  const PITCH_WIN = 10;  // seconds of pitch shown
+  const PITCH_WIN = 30;  // seconds of pitch shown
   const VIB_WIN   = 6;   // seconds of vibrato shown
+  // Hold pitch through tracker dropouts while the summary still shows voicing.
+  const CHART_SILENCE_MS = 1500;
+  const SILENCE_F0 = 80;  // chart y-min on log scale when truly silent
 
   let pitchData   = [];
   let centralData = [];
   let vibData     = [];
   let latestT     = 0;
   let startTs     = null;
+  let lastVoicedF0      = null;
+  let lastVoicedCentral = null;
+  let lastChartVoicedAt = 0;
 
   // ── Charts ─────────────────────────────────────────────────────────
   const baseOpts = {
@@ -358,7 +384,7 @@
           data: pitchData,
           borderColor: '#7eb8f7',
           backgroundColor: '#7eb8f715',
-          pointRadius: 2,
+          pointRadius: 0,
           borderWidth: 1.5,
           spanGaps: false,
           tension: 0,
@@ -370,7 +396,7 @@
           backgroundColor: 'transparent',
           pointRadius: 0,
           borderWidth: 2.5,
-          spanGaps: true,
+          spanGaps: false,
           tension: 0.4,
           order: 1,
         },
@@ -434,11 +460,15 @@
   });
 
   // ── Tuner needle ────────────────────────────────────────────────────
-  function updateTuner(etDevCents, etNote, accuracyPct, voiced) {
+  function updateTuner(etDevCents, etNote, voiced, summary) {
     const needle   = document.getElementById('tunerNeedle');
     const noteEl   = document.getElementById('noteDisplay');
     const devEl    = document.getElementById('etDevText');
-    const accEl    = document.getElementById('accuracyVal');
+    const gestEl   = document.getElementById('gestureVal');
+
+    const gesture = summary?.gesture || 'steady';
+    gestEl.textContent = gesture;
+    gestEl.className = 'gesture-pill ' + gesture;
 
     noteEl.textContent = voiced ? etNote : '—';
 
@@ -455,10 +485,6 @@
       devEl.className   = 'et-dev dim';
     }
 
-    if (accuracyPct > 0) {
-      accEl.textContent = `${accuracyPct.toFixed(0)}%`;
-      accEl.className   = 'accuracy-val ' + (accuracyPct >= 80 ? 'good' : accuracyPct >= 60 ? 'warn' : 'bad');
-    }
   }
 
   // ── Stats panel ─────────────────────────────────────────────────────
@@ -502,25 +528,111 @@
   }
 
   // ── Feedback ────────────────────────────────────────────────────────
-  function getFeedback(s, voiced) {
-    if (!voiced) return 'Sing something to see feedback.';
+  let _lastFeedbackText     = '';
+  let _lastFeedbackUpdate   = 0;
+  let _lastFeedbackCategory = '';
+  let _lastVoicedAt         = 0;
+  let _stablePitchCategory  = 'in-tune';
+  const FEEDBACK_HOLD_MS    = 22000;  // min ms between feedback updates (~22 s to read)
+  const SILENCE_FEEDBACK_MS = 1500;   // wait before showing the silent prompt
+
+  function _summaryVoiced(s) {
+    return !!(s && s.et_note && s.et_note !== '—');
+  }
+
+  function _updatePitchCategory(dev) {
+    switch (_stablePitchCategory) {
+      case 'in-tune':
+        if (dev < -25)      _stablePitchCategory = dev < -35 ? 'flat-bad' : 'flat-mild';
+        else if (dev > 25)  _stablePitchCategory = dev > 35 ? 'sharp-bad' : 'sharp-mild';
+        break;
+      case 'flat-mild':
+        if (dev > -12)      _stablePitchCategory = 'in-tune';
+        else if (dev < -35) _stablePitchCategory = 'flat-bad';
+        break;
+      case 'sharp-mild':
+        if (dev < 12)       _stablePitchCategory = 'in-tune';
+        else if (dev > 35)  _stablePitchCategory = 'sharp-bad';
+        break;
+      case 'flat-bad':
+        if (dev > -28)      _stablePitchCategory = dev > -12 ? 'in-tune' : 'flat-mild';
+        break;
+      case 'sharp-bad':
+        if (dev < 28)       _stablePitchCategory = dev < 12 ? 'in-tune' : 'sharp-mild';
+        break;
+    }
+    return _stablePitchCategory;
+  }
+
+  function _feedbackCategory(s) {
+    if (s.gesture && s.gesture !== 'steady') return `gesture-${s.gesture}`;
+    return _updatePitchCategory(s.et_dev_cents);
+  }
+
+  function getFeedback(s) {
+    if (!_summaryVoiced(s)) return 'Sing something to see feedback.';
     const p    = [];
-    const dev  = s.et_dev_cents;
-    const acc  = s.accuracy_pct;
+    const gest = s.gesture || 'steady';
+    const pitchCat = _stablePitchCategory;
 
-    if      (Math.abs(dev) < 10) p.push('In tune ✓');
-    else if (dev < -25)          p.push(`Flat by ${Math.abs(dev).toFixed(0)}¢ — push up`);
-    else if (dev < -10)          p.push(`Slightly flat (${Math.abs(dev).toFixed(0)}¢ ↓)`);
-    else if (dev >  25)          p.push(`Sharp by ${dev.toFixed(0)}¢ — ease back`);
-    else                         p.push(`Slightly sharp (${dev.toFixed(0)}¢ ↑)`);
+    if (gest === 'transition') {
+      p.push('Note transition — pitch accuracy paused');
+    } else if (gest === 'vibrato') {
+      p.push('Vibrato detected');
+    } else if (gest === 'glissando') {
+      p.push('Glissando — pitch accuracy paused');
+    } else if (pitchCat === 'in-tune') {
+      p.push('In tune ✓');
+    } else if (pitchCat === 'flat-bad') {
+      p.push('Flat — push pitch up');
+    } else if (pitchCat === 'flat-mild') {
+      p.push('Slightly flat — push up a little');
+    } else if (pitchCat === 'sharp-bad') {
+      p.push('Sharp — ease back down');
+    } else {
+      p.push('Slightly sharp — ease back a little');
+    }
 
-    if (acc > 0) p.push(`${acc.toFixed(0)}% pitch accuracy`);
     if (s.cpp > 10)   p.push('Clear voice ✓');
     else if (s.cpp > 5) p.push('Some breathiness — engage support');
     else if (s.cpp > 1.5) p.push('Breathy — support your breath');
-    if (s.dynamic && s.dynamic !== 'silent') p.push(`Dynamic: ${s.dynamic}`);
 
     return p.join('  ·  ');
+  }
+
+  function updateFeedback(s) {
+    const now = Date.now();
+    const summaryVoiced = _summaryVoiced(s);
+    if (summaryVoiced) _lastVoicedAt = now;
+
+    const effectivelySilent = !summaryVoiced
+      && (now - (_lastVoicedAt || 0) >= SILENCE_FEEDBACK_MS);
+
+    // Brief unvoiced gaps: keep the current advice on screen.
+    if (!summaryVoiced && !effectivelySilent) return;
+
+    const category = effectivelySilent ? 'silent' : _feedbackCategory(s);
+    const timedOut = now - _lastFeedbackUpdate >= FEEDBACK_HOLD_MS;
+    const isFirst = _lastFeedbackUpdate === 0;
+    const categoryChanged = category !== _lastFeedbackCategory;
+    const leavingSilent = _lastFeedbackCategory === 'silent' && category !== 'silent';
+
+    if (!isFirst && !timedOut && !leavingSilent) return;
+    if (!isFirst && !leavingSilent && !categoryChanged) return;
+
+    const text = getFeedback(s);
+    if (!isFirst && text === _lastFeedbackText) return;
+
+    _lastFeedbackText     = text;
+    _lastFeedbackCategory = category;
+    _lastFeedbackUpdate   = now;
+
+    const el = document.getElementById('feedbackText');
+    el.style.opacity = '0.45';
+    setTimeout(() => {
+      el.textContent   = text;
+      el.style.opacity = '1';
+    }, 420);
   }
 
   // ── Timer ────────────────────────────────────────────────────────────
@@ -542,7 +654,6 @@
     ws.onopen = () => {
       connEl.textContent = 'Connected';
       connEl.className   = 'conn ok';
-      ws.send(JSON.stringify({ sr: nativeSR }));
       if (onOpen) onOpen();
     };
     ws.onclose = () => {
@@ -556,13 +667,32 @@
       const msg = JSON.parse(evt.data);
       const s   = msg.summary;
 
-      let voiced = false;
+      const summaryVoiced = s.et_note && s.et_note !== '—';
+      if (summaryVoiced) lastChartVoicedAt = Date.now();
+      const chartActive = summaryVoiced
+        || (Date.now() - (lastChartVoicedAt || 0) < CHART_SILENCE_MS);
+
       msg.frames.forEach(f => {
-        pitchData.push({ x: f.t, y: f.f0 });
-        centralData.push({ x: f.t, y: f.central });   // per-frame, not stale summary
-        vibData.push({ x: f.t, y: f.vib });
+        const isVoiced = f.f0 !== null && f.f0 > 0;
+        let yF0, yCentral;
+
+        if (isVoiced) {
+          lastVoicedF0 = f.f0;
+          if (f.central !== null && f.central > 0) lastVoicedCentral = f.central;
+          yF0 = f.f0;
+          yCentral = (f.central !== null && f.central > 0) ? f.central : lastVoicedCentral;
+        } else if (chartActive && lastVoicedF0 !== null) {
+          yF0 = lastVoicedF0;
+          yCentral = lastVoicedCentral ?? lastVoicedF0;
+        } else {
+          yF0 = SILENCE_F0;
+          yCentral = SILENCE_F0;
+        }
+
+        pitchData.push({ x: f.t, y: yF0, voiced: isVoiced });
+        centralData.push({ x: f.t, y: yCentral });
+        vibData.push({ x: f.t, y: (f.vib !== null && f.vib !== undefined) ? f.vib : null });
         if (f.t > latestT) latestT = f.t;
-        if (f.f0 !== null) voiced = true;
       });
 
       // Trim old data
@@ -579,9 +709,9 @@
       pitchChart.update('none');
       vibChart.update('none');
 
-      updateTuner(s.et_dev_cents, s.et_note, s.accuracy_pct, voiced);
-      updateStats(s, voiced);
-      document.getElementById('feedbackText').textContent = getFeedback(s, voiced);
+      updateTuner(s.et_dev_cents, s.et_note, summaryVoiced, s);
+      updateStats(s, summaryVoiced);
+      updateFeedback(s);
     };
 
     setInterval(() => { if (ws && ws.readyState === WebSocket.OPEN) ws.send('ping'); }, 8000);
@@ -601,23 +731,57 @@
       nativeSR       = audioCtx.sampleRate;
 
       connectWS(() => {
-        // Mic → ScriptProcessor → WebSocket
+        const FRAME = 160;   // 10 ms at 16 kHz — matches NanoPitch C/WASM
+        const TARGET_SR = 16000;
+        // WS is already open here — must send SR now (onopen override would never fire).
+        ws.send(JSON.stringify({ sr: TARGET_SR }));
+
         const source = audioCtx.createMediaStreamSource(stream);
-        const proc   = audioCtx.createScriptProcessor(1024, 1, 1);  // 23 ms at 44.1 kHz
+        const proc   = audioCtx.createScriptProcessor(512, 1, 1);
         source.connect(proc);
         proc.connect(audioCtx.destination);
 
+        let resampleBuf = new Float32Array(0);
+        const ratio = nativeSR / TARGET_SR;
+
         proc.onaudioprocess = (e) => {
           if (!ws || ws.readyState !== WebSocket.OPEN) return;
-          ws.send(new Float32Array(e.inputBuffer.getChannelData(0)).buffer);
-        };
+          const input = e.inputBuffer.getChannelData(0);
+          let resampled;
+          if (Math.abs(nativeSR - TARGET_SR) > 10) {
+            const outLen = Math.floor(input.length / ratio);
+            resampled = new Float32Array(outLen);
+            for (let i = 0; i < outLen; i++) {
+              const idx = Math.floor(i * ratio);
+              resampled[i] = idx < input.length ? input[idx] : 0;
+            }
+          } else {
+            resampled = input;
+          }
 
-        // Re-send SR on every reconnect
-        const origOnOpen = ws.onopen.bind(ws);
-        ws.onopen = (...a) => { origOnOpen(...a); ws.send(JSON.stringify({ sr: nativeSR })); };
+          const merged = new Float32Array(resampleBuf.length + resampled.length);
+          merged.set(resampleBuf);
+          merged.set(resampled, resampleBuf.length);
+          resampleBuf = merged;
+
+          while (resampleBuf.length >= FRAME) {
+            ws.send(resampleBuf.subarray(0, FRAME).buffer);
+            resampleBuf = resampleBuf.slice(FRAME);
+          }
+        };
       });
 
-      if (!startTs) startTs = Date.now();
+      if (!startTs) {
+        startTs = Date.now();
+        lastVoicedF0 = null;
+        lastVoicedCentral = null;
+        lastChartVoicedAt = 0;
+        _lastFeedbackText = '';
+        _lastFeedbackUpdate = 0;
+        _lastFeedbackCategory = '';
+        _lastVoicedAt = 0;
+        _stablePitchCategory = 'in-tune';
+      }
       document.getElementById('overlay').style.display = 'none';
 
     } catch (err) {
