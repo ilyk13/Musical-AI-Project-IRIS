@@ -1,7 +1,27 @@
 # IRIS — AI Vocal Coach
 **Ilysia Krzywonos & Chris Zhao**
 
-Real-time feedback on singing technique — pitch, gesture (vibrato/glissando/transition), breathiness, and dynamics — from a browser microphone with sub-100 ms latency.
+Real-time singing feedback from the browser mic — pitch, gesture (vibrato/glissando/transition), breathiness, and dynamics with sub-100 ms latency.
+
+---
+
+## Current progress
+
+### Working
+- **NanoPitch** — streaming GRU pitch tracker (10 ms frames, Viterbi decode, live tuner + pitch chart)
+- **Live dashboard** — pitch, vibrato wave, breathiness (CPP), dynamics (pp→ff), coaching bar
+- **NanoPitch+ (VocalSet fine-tune)** — gesture-aware pitch decoding in the live pipeline
+- **Gesture pill** — steady / vibrato / glissando / transition (model + heuristics; vibrato aligned with chart)
+
+### Trained, still fine-tuning
+- Multi-task **NanoPitch+** heads: gesture (~28% val acc), register, dynamics — not all in UI yet
+- **Gesture-aware Viterbi** — wider pitch paths on non-steady frames; ET scoring on steady notes only
+- Hybrid design: learned gesture head + signal-processing fallbacks where the model is weak
+
+### Next: phrasing awareness
+- **BreathCNN** + phrase boundaries → segment performances, not just frames
+- Per-phrase feedback: drift, vibrato quality, dynamics arc
+- Richer coaching: evaluation after this phrase… instead of only live tuner/CPP hints
 
 ---
 
