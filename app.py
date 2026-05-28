@@ -23,8 +23,8 @@ import librosa
 import numpy as np
 import torch
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse
 from scipy.signal import savgol_filter
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -48,6 +48,8 @@ from features.dynamics.dynamic_class import classify_dynamic
 from features.breath.cpp import compute_cpp
 from features.breath.spectral_tilt import compute_spectral_tilt_slope
 from features.vibrato.bandpass import bandpass_vibrato
+from features.vibrato.parameters import extract_vibrato_params
+from features.pitch.pitch_drift import analyze_drift, aggregate_drift_score
 from model.nanopitch import viterbi_stream_gesture
 
 # ── Constants ──────────────────────────────────────────────────────────
@@ -198,6 +200,10 @@ class ClientState:
     model_frame_n:   int        = 0
     streaming_state: dict | None = field(default=None)
     viterbi_state:   np.ndarray | None = field(default=None)
+    # Vibrato parameters (updated every VIB_EVERY chunks)
+    last_vib_rate_hz:     float = float('nan')
+    last_vib_depth_cents: float = float('nan')
+    last_vib_consistency: float = 0.0
 
 
 # ── Feature extraction ─────────────────────────────────────────────────
@@ -347,6 +353,17 @@ def _extract(state: ClientState, chunk: np.ndarray,
         else:
             state.cached_vib = np.zeros(max(len(f0_roll), 1), dtype=np.float32)
 
+        # Extract vibrato parameters from the refreshed cached signal
+        try:
+            vp = extract_vibrato_params(state.cached_vib, frame_rate_hz=100.0)
+            if vp is not None:
+                state.last_vib_consistency = vp.consistency
+                if vp.has_vibrato:
+                    state.last_vib_rate_hz     = vp.rate_hz
+                    state.last_vib_depth_cents = vp.depth_cents
+        except Exception:
+            pass
+
     vib_latest = (
         state.cached_vib[-n_new:].astype(np.float32)
         if len(state.cached_vib) >= n_new
@@ -393,15 +410,18 @@ def _extract(state: ClientState, chunk: np.ndarray,
     return {
         "frames": frames,
         "summary": {
-            "dbfs":         round(state.last_dbfs, 1),
-            "dynamic":      state.last_dynamic,
-            "cpp":          round(state.last_cpp, 2),
-            "tilt":         round(state.last_tilt, 1),
-            "et_note":      et_note,
-            "et_dev_cents": round(et_dev, 1),
-            "gesture":      gesture_name(gesture_display),
-            "gesture_raw":  gesture_name(gesture_now),
-            "gesture_source": _gesture_source,
+            "dbfs":             round(state.last_dbfs, 1),
+            "dynamic":          state.last_dynamic,
+            "cpp":              round(state.last_cpp, 2),
+            "tilt":             round(state.last_tilt, 1),
+            "et_note":          et_note,
+            "et_dev_cents":     round(et_dev, 1),
+            "gesture":          gesture_name(gesture_display),
+            "gesture_raw":      gesture_name(gesture_now),
+            "gesture_source":   _gesture_source,
+            "vib_rate_hz":      None if np.isnan(state.last_vib_rate_hz)     else round(state.last_vib_rate_hz, 2),
+            "vib_depth_cents":  None if np.isnan(state.last_vib_depth_cents) else round(state.last_vib_depth_cents, 1),
+            "vib_consistency":  round(state.last_vib_consistency, 3),
         },
     }
 
@@ -498,6 +518,283 @@ async def ws_endpoint(ws: WebSocket) -> None:
         with contextlib.suppress(asyncio.CancelledError):
             await proc
         print("Browser disconnected")
+
+
+# ── Post-session analysis ───────────────────────────────────────────────
+
+def _segment_phrases(
+    f0: np.ndarray,
+    t: np.ndarray,
+    min_silence_s: float = 0.4,
+    min_phrase_s: float = 0.5,
+) -> list[tuple[int, int]]:
+    """Split f0 array into phrases separated by silence gaps."""
+    fps = 100.0
+    if len(t) > 2:
+        diffs = np.diff(t[:min(50, len(t))])
+        valid = diffs[(diffs > 0) & (diffs < 0.5)]
+        if len(valid):
+            fps = float(np.clip(1.0 / float(np.median(valid)), 10.0, 200.0))
+
+    min_sil = max(1, int(min_silence_s * fps))
+    min_len = max(5, int(min_phrase_s  * fps))
+    voiced  = f0 > 0
+
+    phrases: list[tuple[int, int]] = []
+    in_seg = False
+    seg_start = 0
+    silence_run = 0
+
+    for i, v in enumerate(voiced):
+        if v:
+            if not in_seg:
+                in_seg = True
+                seg_start = i
+            silence_run = 0
+        else:
+            if in_seg:
+                silence_run += 1
+                if silence_run >= min_sil:
+                    end = i - silence_run + 1
+                    if end - seg_start >= min_len:
+                        phrases.append((seg_start, end))
+                    in_seg = False
+                    silence_run = 0
+
+    if in_seg:
+        end = len(f0)
+        if end - seg_start >= min_len:
+            phrases.append((seg_start, end))
+
+    return phrases or [(0, len(f0))]
+
+
+def _phrase_bullets(
+    pitch_score: float,
+    drift_results: list,
+    vp,
+    cpp_mean: float,
+    dbfs_std: float,
+) -> list[str]:
+    bullets: list[str] = []
+
+    # Pitch accuracy
+    if pitch_score >= 85:
+        bullets.append("Pitch stable")
+    elif pitch_score >= 65:
+        bullets.append("Pitch mostly stable")
+    else:
+        if drift_results:
+            trend = float(np.mean([r.trend_cents_s for r in drift_results]))
+            if trend < -5.0:
+                bullets.append("Pitch drifted flat")
+            elif trend > 5.0:
+                bullets.append("Pitch drifted sharp")
+            else:
+                bullets.append("Pitch accuracy needs work")
+        else:
+            bullets.append("Pitch accuracy needs work")
+
+    # Vibrato (only if vibrato was detected)
+    if vp is not None and vp.has_vibrato:
+        rate_ok  = 5.0 <= vp.rate_hz <= 7.0
+        depth_ok = 25.0 <= vp.depth_cents / 2.0 <= 75.0
+        if rate_ok and depth_ok and vp.consistency > 0.2:
+            bullets.append("Nice vibrato")
+        elif vp.consistency < 0.15:
+            bullets.append("Vibrato irregular")
+        elif not rate_ok:
+            direction = "slow" if vp.rate_hz < 5.0 else "fast"
+            bullets.append(f"Vibrato rate {direction} ({vp.rate_hz:.1f} Hz)")
+        else:
+            bullets.append("Vibrato depth off-range")
+
+    # Breathiness / breath support
+    if cpp_mean > 9.0:
+        bullets.append("Great breath support")
+    elif cpp_mean > 5.0:
+        bullets.append("Good breath support")
+    elif cpp_mean > 2.0:
+        bullets.append("Breathiness rising")
+    else:
+        bullets.append("Weak breath support")
+
+    # Dynamics (only if there is room)
+    if len(bullets) < 3:
+        if dbfs_std > 10.0:
+            bullets.append("Dynamics inconsistent")
+        else:
+            bullets.append("Good dynamics")
+
+    return bullets[:3]
+
+
+def _run_analysis(frames: list[dict], summaries: list[dict]) -> dict:
+    """Run post-session analysis and return structured results."""
+    if len(frames) < 20:
+        return {"error": "not_enough_data", "session_score": 0,
+                "scores": {}, "phrases": [], "trend": {}, "total_duration": 0}
+
+    # ── Build numpy arrays ────────────────────────────────────────────
+    f0      = np.array([f.get("f0") or 0.0 for f in frames], dtype=np.float32)
+    central = np.array(
+        [f.get("central") if f.get("central") is not None else float("nan") for f in frames],
+        dtype=np.float32,
+    )
+    vib = np.array(
+        [f.get("vib") if f.get("vib") is not None else float("nan") for f in frames],
+        dtype=np.float32,
+    )
+    t = np.array([f.get("t", i * 0.01) for i, f in enumerate(frames)], dtype=np.float32)
+
+    # Estimate frame rate from timestamps
+    fps = 100.0
+    if len(t) > 2:
+        diffs = np.diff(t[:min(50, len(t))])
+        valid = diffs[(diffs > 0) & (diffs < 0.5)]
+        if len(valid):
+            fps = float(np.clip(1.0 / float(np.median(valid)), 10.0, 200.0))
+
+    # Summary arrays
+    sum_t    = np.array([float(s.get("t", i * 0.1))    for i, s in enumerate(summaries)], dtype=np.float32)
+    sum_cpp  = np.array([float(s.get("cpp",   0.0))    for s in summaries], dtype=np.float32)
+    sum_dbfs = np.array([float(s.get("dbfs", -80.0))   for s in summaries], dtype=np.float32)
+
+    # ── Phrase segmentation ───────────────────────────────────────────
+    phrase_ranges = _segment_phrases(f0, t)
+
+    phrase_results = []
+    for idx, (start, end) in enumerate(phrase_ranges):
+        f0_p      = f0[start:end]
+        central_p = central[start:end]
+        vib_p     = vib[start:end]
+        t_start   = float(t[start])
+        t_end     = float(t[min(end - 1, len(t) - 1)])
+        n_voiced  = int((f0_p > 0).sum())
+
+        # ── Pitch drift ──────────────────────────────────────────────
+        drift_results = analyze_drift(f0_p, central_p, frame_hop_s=1.0 / fps)
+        pitch_score   = aggregate_drift_score(drift_results)
+
+        # ── Vibrato parameters ───────────────────────────────────────
+        vp        = None
+        vib_score = 50.0
+        if n_voiced >= max(5, int(0.25 * fps)):
+            try:
+                vp = extract_vibrato_params(vib_p, frame_rate_hz=fps)
+                if vp is not None and vp.has_vibrato:
+                    vib_score = float(
+                        vp.rate_score * 0.4
+                        + vp.depth_score * 0.4
+                        + min(100.0, vp.consistency * 400.0) * 0.2
+                    )
+            except Exception:
+                pass
+
+        # ── CPP / breath support ─────────────────────────────────────
+        if len(sum_t):
+            mask    = (sum_t >= t_start) & (sum_t <= t_end)
+            cpp_arr = sum_cpp[mask]
+        else:
+            cpp_arr = np.array([], dtype=np.float32)
+        cpp_mean     = float(np.mean(cpp_arr)) if len(cpp_arr) else 0.0
+        breath_score = float(np.clip(cpp_mean * 5.5, 0.0, 100.0))
+
+        # ── Dynamics control ─────────────────────────────────────────
+        if len(sum_t):
+            mask     = (sum_t >= t_start) & (sum_t <= t_end)
+            dbfs_arr = sum_dbfs[mask]
+        else:
+            dbfs_arr = np.array([], dtype=np.float32)
+
+        if len(dbfs_arr) > 2:
+            dbfs_std  = float(np.std(dbfs_arr))
+            if dbfs_std < 2.0:
+                dyn_score = 60.0
+            elif dbfs_std <= 8.0:
+                dyn_score = 100.0
+            else:
+                dyn_score = float(max(0.0, 100.0 - (dbfs_std - 8.0) * 4.0))
+        else:
+            dbfs_std  = 5.0
+            dyn_score = 75.0
+
+        # ── Overall phrase score (weighted) ──────────────────────────
+        phrase_score = (
+            pitch_score  * 0.40
+            + vib_score  * 0.20
+            + breath_score * 0.25
+            + dyn_score  * 0.15
+        )
+        rating = (
+            "Excellent"  if phrase_score >= 82 else
+            "Good"       if phrase_score >= 62 else
+            "Needs Work"
+        )
+        bullets = _phrase_bullets(pitch_score, drift_results, vp, cpp_mean, dbfs_std)
+
+        phrase_results.append({
+            "idx":            idx + 1,
+            "start_t":        round(t_start, 2),
+            "end_t":          round(t_end, 2),
+            "rating":         rating,
+            "score":          round(phrase_score, 1),
+            "pitch_score":    round(pitch_score, 1),
+            "vib_score":      round(vib_score, 1),
+            "breath_score":   round(breath_score, 1),
+            "dynamics_score": round(dyn_score, 1),
+            "bullets":        bullets,
+        })
+
+    # ── Session-level weighted aggregates ────────────────────────────
+    if phrase_results:
+        durations = np.array([p["end_t"] - p["start_t"] for p in phrase_results], dtype=np.float64)
+        total_dur = durations.sum()
+        w = durations / total_dur if total_dur > 0 else np.ones(len(phrase_results)) / len(phrase_results)
+        pitch_acc  = float(np.dot([p["pitch_score"]    for p in phrase_results], w))
+        vib_stab   = float(np.dot([p["vib_score"]      for p in phrase_results], w))
+        breath_sup = float(np.dot([p["breath_score"]   for p in phrase_results], w))
+        dyn_ctrl   = float(np.dot([p["dynamics_score"] for p in phrase_results], w))
+    else:
+        pitch_acc = vib_stab = breath_sup = dyn_ctrl = 50.0
+
+    overall = pitch_acc * 0.40 + vib_stab * 0.20 + breath_sup * 0.25 + dyn_ctrl * 0.15
+
+    return {
+        "session_score": round(overall, 1),
+        "scores": {
+            "pitch_accuracy":    round(pitch_acc, 1),
+            "vibrato_stability": round(vib_stab, 1),
+            "breath_support":    round(breath_sup, 1),
+            "dynamics_control":  round(dyn_ctrl, 1),
+        },
+        "phrases": phrase_results,
+        "trend": {
+            "phrase_labels":   [f"P{p['idx']}" for p in phrase_results],
+            "pitch_scores":    [p["pitch_score"]    for p in phrase_results],
+            "vib_scores":      [p["vib_score"]      for p in phrase_results],
+            "breath_scores":   [p["breath_score"]   for p in phrase_results],
+            "dynamics_scores": [p["dynamics_score"] for p in phrase_results],
+        },
+        "total_duration": round(float(t[-1]) if len(t) else 0.0, 2),
+    }
+
+
+@app.post("/analyze")
+async def analyze_session(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid_json"}, status_code=400)
+
+    frames    = body.get("frames",    [])
+    summaries = body.get("summaries", [])
+
+    if not frames:
+        return JSONResponse({"error": "no_data"}, status_code=400)
+
+    result = await asyncio.to_thread(_run_analysis, frames, summaries)
+    return JSONResponse(result)
 
 
 @app.get("/")
