@@ -574,7 +574,9 @@ def _phrase_bullets(
     drift_results: list,
     vp,
     cpp_mean: float,
+    cpp_std: float,
     dbfs_std: float,
+    is_breathy_outlier: bool = False,
 ) -> list[str]:
     bullets: list[str] = []
 
@@ -609,11 +611,19 @@ def _phrase_bullets(
         else:
             bullets.append("Vibrato depth off-range")
 
-    # Breathiness / breath support
-    if cpp_mean > 9.0:
-        bullets.append("Great breath support")
+    # Breathiness / breath support (cross-phrase outlier takes priority)
+    if is_breathy_outlier:
+        bullets.append("Much breathier than your other phrases")
+    elif cpp_mean > 9.0:
+        if cpp_std > 3.5:
+            bullets.append("Clear voice, but breath support varies")
+        else:
+            bullets.append("Great breath support")
     elif cpp_mean > 5.0:
-        bullets.append("Good breath support")
+        if cpp_std > 3.5:
+            bullets.append("Breath support varies — try to stay consistent")
+        else:
+            bullets.append("Good breath support")
     elif cpp_mean > 2.0:
         bullets.append("Breathiness rising")
     else:
@@ -645,6 +655,10 @@ def _run_analysis(frames: list[dict], summaries: list[dict]) -> dict:
         [f.get("vib") if f.get("vib") is not None else float("nan") for f in frames],
         dtype=np.float32,
     )
+    # ET accuracy per frame: deviation from nearest equal-temperament note
+    et_dev  = np.array([float(f.get("et_dev_cents", 0.0)) for f in frames], dtype=np.float32)
+    # scored = True only for steady frames (excludes vibrato/glissando/transition)
+    scored  = np.array([bool(f.get("scored", True)) for f in frames], dtype=bool)
     t = np.array([f.get("t", i * 0.01) for i, f in enumerate(frames)], dtype=np.float32)
 
     # Estimate frame rate from timestamps
@@ -663,20 +677,35 @@ def _run_analysis(frames: list[dict], summaries: list[dict]) -> dict:
     # ── Phrase segmentation ───────────────────────────────────────────
     phrase_ranges = _segment_phrases(f0, t)
 
-    phrase_results = []
+    # ── Phase 1: compute per-phrase metrics ───────────────────────────
+    phrase_metrics: list[dict] = []
     for idx, (start, end) in enumerate(phrase_ranges):
         f0_p      = f0[start:end]
         central_p = central[start:end]
         vib_p     = vib[start:end]
+        et_dev_p  = et_dev[start:end]
+        scored_p  = scored[start:end]
         t_start   = float(t[start])
         t_end     = float(t[min(end - 1, len(t) - 1)])
         n_voiced  = int((f0_p > 0).sum())
 
-        # ── Pitch drift ──────────────────────────────────────────────
+        # Pitch accuracy = ET deviation on steady voiced frames (primary)
+        # + drift stability from central pitch (secondary, detects wandering)
         drift_results = analyze_drift(f0_p, central_p, frame_hop_s=1.0 / fps)
-        pitch_score   = aggregate_drift_score(drift_results)
+        drift_score   = aggregate_drift_score(drift_results)
 
-        # ── Vibrato parameters ───────────────────────────────────────
+        et_mask = scored_p & (f0_p > 0)
+        if et_mask.sum() >= 3:
+            mean_et_dev = float(np.mean(np.abs(et_dev_p[et_mask])))
+            # 0 cents → 100, 50 cents (max possible) → 0
+            et_score = float(max(0.0, 100.0 * (1.0 - mean_et_dev / 50.0)))
+        else:
+            et_score = drift_score  # not enough steady frames, fall back
+
+        # ET accuracy is the main signal; drift catches gradual wandering
+        pitch_score = 0.75 * et_score + 0.25 * drift_score
+
+        # Vibrato parameters
         vp        = None
         vib_score = 50.0
         if n_voiced >= max(5, int(0.25 * fps)):
@@ -691,22 +720,44 @@ def _run_analysis(frames: list[dict], summaries: list[dict]) -> dict:
             except Exception:
                 pass
 
-        # ── CPP / breath support ─────────────────────────────────────
+        # CPP: level + gentle within-phrase consistency penalty
         if len(sum_t):
             mask    = (sum_t >= t_start) & (sum_t <= t_end)
             cpp_arr = sum_cpp[mask]
         else:
             cpp_arr = np.array([], dtype=np.float32)
-        cpp_mean     = float(np.mean(cpp_arr)) if len(cpp_arr) else 0.0
-        breath_score = float(np.clip(cpp_mean * 5.5, 0.0, 100.0))
 
-        # ── Dynamics control ─────────────────────────────────────────
+        if len(cpp_arr) == 0:
+            # No CPP data in this phrase time range — neutral score
+            cpp_mean     = 0.0
+            cpp_std      = 0.0
+            breath_score = 50.0
+        else:
+            cpp_mean = float(np.mean(cpp_arr))
+            cpp_std  = float(np.std(cpp_arr)) if len(cpp_arr) > 2 else 0.0
+            # Piecewise-linear score calibrated to the live-UI CPP thresholds:
+            #   >10 dB (Clear voice)      → 70–100
+            #   5–10 dB (Some breathiness)→ 40–70
+            #   1.5–5 dB (Breathy)        → 10–40
+            #   <1.5 dB                   →  0–10
+            breath_score = float(np.clip(
+                np.interp(cpp_mean,
+                          [0.0,  1.5,  5.0,  10.0, 18.0],
+                          [0.0, 10.0, 40.0,  70.0, 100.0]),
+                0.0, 100.0,
+            ))
+            # Gentle within-phrase consistency penalty (caps at −15 pts).
+            # Only applied when std exceeds 2 dB (normal variation); the
+            # cross-phrase outlier flag handles larger consistency concerns.
+            if cpp_std > 2.0:
+                breath_score = max(0.0, breath_score - min(15.0, (cpp_std - 2.0) * 2.5))
+
+        # Dynamics control
         if len(sum_t):
             mask     = (sum_t >= t_start) & (sum_t <= t_end)
             dbfs_arr = sum_dbfs[mask]
         else:
             dbfs_arr = np.array([], dtype=np.float32)
-
         if len(dbfs_arr) > 2:
             dbfs_std  = float(np.std(dbfs_arr))
             if dbfs_std < 2.0:
@@ -719,30 +770,68 @@ def _run_analysis(frames: list[dict], summaries: list[dict]) -> dict:
             dbfs_std  = 5.0
             dyn_score = 75.0
 
-        # ── Overall phrase score (weighted) ──────────────────────────
+        phrase_metrics.append({
+            "idx":          idx,
+            "t_start":      t_start,
+            "t_end":        t_end,
+            "pitch_score":  pitch_score,
+            "drift_results": drift_results,
+            "vp":           vp,
+            "vib_score":    vib_score,
+            "cpp_mean":     cpp_mean,
+            "cpp_std":      cpp_std,
+            "breath_score": breath_score,
+            "dbfs_std":     dbfs_std,
+            "dyn_score":    dyn_score,
+        })
+
+    # ── Phase 2: cross-phrase breathiness outlier detection ───────────
+    # Flag a phrase as a "breathy outlier" when its mean CPP is notably
+    # lower than the session median (i.e. unexpectedly breathy relative
+    # to the rest of the session) and falls in the breathy zone (<7 dB).
+    cpp_means_arr = np.array([m["cpp_mean"] for m in phrase_metrics])
+    if len(cpp_means_arr) > 1:
+        session_cpp_med = float(np.median(cpp_means_arr))
+        session_cpp_std = float(np.std(cpp_means_arr))
+        outlier_gap     = max(3.0, session_cpp_std)
+        for m in phrase_metrics:
+            m["is_breathy_outlier"] = (
+                m["cpp_mean"] < session_cpp_med - outlier_gap
+                and m["cpp_mean"] < 7.0
+            )
+    else:
+        for m in phrase_metrics:
+            m["is_breathy_outlier"] = False
+
+    # ── Phase 3: build final phrase results with bullets ─────────────
+    phrase_results = []
+    for m in phrase_metrics:
         phrase_score = (
-            pitch_score  * 0.40
-            + vib_score  * 0.20
-            + breath_score * 0.25
-            + dyn_score  * 0.15
+            m["pitch_score"] * 0.40
+            + m["vib_score"] * 0.20
+            + m["breath_score"] * 0.25
+            + m["dyn_score"] * 0.15
         )
         rating = (
             "Excellent"  if phrase_score >= 82 else
             "Good"       if phrase_score >= 62 else
             "Needs Work"
         )
-        bullets = _phrase_bullets(pitch_score, drift_results, vp, cpp_mean, dbfs_std)
-
+        bullets = _phrase_bullets(
+            m["pitch_score"], m["drift_results"], m["vp"],
+            m["cpp_mean"], m["cpp_std"], m["dbfs_std"],
+            is_breathy_outlier=m["is_breathy_outlier"],
+        )
         phrase_results.append({
-            "idx":            idx + 1,
-            "start_t":        round(t_start, 2),
-            "end_t":          round(t_end, 2),
+            "idx":            m["idx"] + 1,
+            "start_t":        round(m["t_start"], 2),
+            "end_t":          round(m["t_end"], 2),
             "rating":         rating,
             "score":          round(phrase_score, 1),
-            "pitch_score":    round(pitch_score, 1),
-            "vib_score":      round(vib_score, 1),
-            "breath_score":   round(breath_score, 1),
-            "dynamics_score": round(dyn_score, 1),
+            "pitch_score":    round(m["pitch_score"], 1),
+            "vib_score":      round(m["vib_score"], 1),
+            "breath_score":   round(m["breath_score"], 1),
+            "dynamics_score": round(m["dyn_score"], 1),
             "bullets":        bullets,
         })
 

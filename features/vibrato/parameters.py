@@ -52,7 +52,7 @@ def extract_vibrato_params(
     vibrato_signal: np.ndarray,
     frame_rate_hz: float = 100.0,
     min_duration_s: float = 0.3,
-    vibrato_energy_threshold: float = 3.0,
+    vibrato_energy_threshold: float = 10.0,
 ) -> VibratoParams | None:
     """Extract vibrato parameters from a band-pass filtered vibrato signal.
 

@@ -376,6 +376,77 @@
       display: flex; align-items: center; justify-content: center;
       width: 100%; font-size: 0.82rem; color: var(--dim); padding: 16px;
     }
+
+    /* Phrase card replay button */
+    .phrase-view-btn {
+      margin-top: 8px; width: 100%; background: none;
+      border: 1px solid var(--border); color: var(--dim);
+      padding: 5px 8px; border-radius: 6px;
+      font-size: 0.72rem; cursor: pointer; letter-spacing: 0.3px;
+      transition: background 0.12s, color 0.12s, border-color 0.12s;
+    }
+    .phrase-view-btn:hover { background: var(--border); color: var(--text); border-color: var(--dim); }
+
+    /* ── Phrase Detail Modal ───────────────────────────────────────── */
+    #phraseModal {
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,0.72);
+      backdrop-filter: blur(4px);
+      z-index: 200;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .modal-box {
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: 14px; width: min(860px, 96vw); max-height: 90vh;
+      overflow-y: auto; display: flex; flex-direction: column;
+    }
+    .modal-hdr {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 14px 18px; border-bottom: 1px solid var(--border);
+      position: sticky; top: 0; background: var(--card); z-index: 1;
+    }
+    .modal-title    { font-size: 0.95rem; font-weight: 700; color: var(--text); }
+    .modal-subtitle { font-size: 0.72rem; color: var(--dim); margin-top: 2px; }
+    .modal-close-btn {
+      background: none; border: none; color: var(--dim);
+      font-size: 1.5rem; line-height: 1; cursor: pointer;
+      padding: 2px 8px; border-radius: 6px;
+    }
+    .modal-close-btn:hover { background: var(--border); color: var(--text); }
+    .modal-audio-bar {
+      display: flex; align-items: center; gap: 12px;
+      padding: 9px 18px; border-bottom: 1px solid var(--border);
+      background: #13131f;
+    }
+    .modal-play-btn {
+      background: var(--blue); border: none; color: var(--bg);
+      border-radius: 50%; width: 32px; height: 32px;
+      font-size: 0.9rem; cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      flex-shrink: 0; transition: background 0.12s;
+    }
+    .modal-play-btn:hover { background: #a8d0ff; }
+    .modal-progress-track {
+      flex: 1; height: 4px; background: var(--border);
+      border-radius: 2px; overflow: hidden; cursor: pointer;
+    }
+    .modal-progress-fill {
+      height: 100%; background: var(--blue);
+      border-radius: 2px; width: 0%; transition: width 0.08s linear;
+    }
+    .modal-audio-time { font-size: 0.72rem; color: var(--dim); white-space: nowrap; }
+    .modal-charts-grid {
+      display: grid; grid-template-columns: 1fr 1fr;
+      gap: 1px; background: var(--border);
+    }
+    .modal-chart-pane {
+      background: var(--card); padding: 14px 14px 10px;
+    }
+    .modal-chart-pane-lbl {
+      font-size: 0.68rem; font-weight: 600; text-transform: uppercase;
+      letter-spacing: 0.5px; color: var(--dim); margin-bottom: 6px;
+    }
+    .modal-chart-wrap { position: relative; height: 155px; }
   </style>
 </head>
 <body>
@@ -608,6 +679,44 @@
   </div><!-- /analysis-layout -->
 </div><!-- /analysisScreen -->
 
+<!-- ── Phrase Detail Modal ────────────────────────────────────────── -->
+<div id="phraseModal" style="display:none;">
+  <div class="modal-box">
+    <div class="modal-hdr">
+      <div>
+        <div class="modal-title" id="modalTitle">Phrase 1</div>
+        <div class="modal-subtitle" id="modalSubtitle"></div>
+      </div>
+      <button class="modal-close-btn" id="modalCloseBtn">×</button>
+    </div>
+    <div class="modal-audio-bar">
+      <button class="modal-play-btn" id="modalPlayBtn" title="Play / Pause phrase audio">▶</button>
+      <div class="modal-progress-track" id="modalProgressTrack">
+        <div class="modal-progress-fill" id="modalProgressFill"></div>
+      </div>
+      <div class="modal-audio-time" id="modalAudioTime">0.0 / 0.0 s</div>
+    </div>
+    <div class="modal-charts-grid">
+      <div class="modal-chart-pane">
+        <div class="modal-chart-pane-lbl">Pitch  (f0 colored by ET accuracy · dashed = central)</div>
+        <div class="modal-chart-wrap"><canvas id="modalPitchChart"></canvas></div>
+      </div>
+      <div class="modal-chart-pane">
+        <div class="modal-chart-pane-lbl">Vibrato deviation (¢ from central)</div>
+        <div class="modal-chart-wrap"><canvas id="modalVibratoChart"></canvas></div>
+      </div>
+      <div class="modal-chart-pane">
+        <div class="modal-chart-pane-lbl">Breathiness — CPP (↑ clearer)</div>
+        <div class="modal-chart-wrap"><canvas id="modalBreathChart"></canvas></div>
+      </div>
+      <div class="modal-chart-pane">
+        <div class="modal-chart-pane-lbl">Loudness — dBFS (↑ louder)</div>
+        <div class="modal-chart-wrap"><canvas id="modalLoudnessChart"></canvas></div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script>
   // ── Chart.js globals ──────────────────────────────────────────────
   Chart.defaults.color       = '#555577';
@@ -627,9 +736,10 @@
   let lastVoicedCentral = null;
   let lastChartVoicedAt = 0;
 
-  // Accumulated for /analyze POST
+  // Accumulated for /analyze POST and phrase replay
   let allFrames    = [];
   let allSummaries = [];
+  let allAudioPCM  = [];   // 16 kHz Float32Array chunks for phrase replay
 
   // Audio / WS handles
   let ws         = null;
@@ -931,14 +1041,14 @@
       msg.frames.forEach(f => {
         const useHz = (f.gesture === 'vibrato' && f.central) ? f.central : f.f0;
         allFrames.push({
-          t:       f.t,
-          f0:      f.f0,
-          central: f.central,
-          vib:     f.vib,
-          etDev:   useHz ? hzToEtDev(useHz) : null,
-          voiced:  !!(f.f0 && f.f0 > 0),
-          gesture: f.gesture,
-          scored:  f.scored,
+          t:            f.t,
+          f0:           f.f0,
+          central:      f.central,
+          vib:          f.vib,
+          et_dev_cents: useHz ? hzToEtDev(useHz) : 0,
+          voiced:       !!(f.f0 && f.f0 > 0),
+          gesture:      f.gesture,
+          scored:       f.scored,
         });
       });
       const lastT = msg.frames[msg.frames.length - 1]?.t ?? 0;
@@ -1211,10 +1321,251 @@
           <span class="phrase-num">Phrase ${ph.idx}</span>
           <span class="phrase-rating">${ph.rating}</span>
         </div>
-        <ul class="phrase-bullets">${bullets}</ul>`;
+        <ul class="phrase-bullets">${bullets}</ul>
+        <button class="phrase-view-btn">▶ Replay &amp; Charts</button>`;
+      card.querySelector('.phrase-view-btn').addEventListener('click', () => openPhraseModal(ph));
       row.appendChild(card);
     });
   }
+
+  // ── Phrase Detail Modal ────────────────────────────────────────────
+  const SR16 = 16000;
+  let _modalCharts    = {};
+  let _modalSrc       = null;
+  let _modalPlayStart = 0;   // audioCtx.currentTime at play start
+  let _modalOffset    = 0;   // resume-from offset within phrase PCM
+  let _modalDuration  = 0;
+  let _modalPCM       = null;
+  let _modalRAF       = 0;
+
+  function _stopModalAudio() {
+    if (_modalSrc) { try { _modalSrc.stop(); } catch(_) {} _modalSrc = null; }
+    cancelAnimationFrame(_modalRAF);
+    document.getElementById('modalPlayBtn').textContent = '▶';
+  }
+
+  function _closeModal() {
+    _stopModalAudio();
+    _modalOffset = 0;
+    document.getElementById('phraseModal').style.display = 'none';
+    document.getElementById('modalProgressFill').style.width = '0%';
+    document.getElementById('modalAudioTime').textContent  = '0.0 / 0.0 s';
+    Object.values(_modalCharts).forEach(c => { try { c.destroy(); } catch(_) {} });
+    _modalCharts = {};
+  }
+
+  function _modalPlayToggle() {
+    if (!_modalPCM) return;
+
+    // The recording AudioContext is closed when the session ends.
+    // Create a fresh one for playback if needed.
+    if (!audioCtx_ || audioCtx_.state === 'closed') {
+      audioCtx_ = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    if (audioCtx_.state === 'suspended') {
+      audioCtx_.resume().catch(() => {});
+    }
+
+    if (_modalSrc) {
+      // Pause — remember position
+      _modalOffset = Math.min(
+        audioCtx_.currentTime - _modalPlayStart + _modalOffset,
+        _modalDuration,
+      );
+      _stopModalAudio();
+      return;
+    }
+    // Play from _modalOffset (AudioBuffer sample rate = 16 kHz; browser resamples automatically)
+    const buf = audioCtx_.createBuffer(1, _modalPCM.length, SR16);
+    buf.copyToChannel(_modalPCM, 0);
+    _modalSrc = audioCtx_.createBufferSource();
+    _modalSrc.buffer = buf;
+    _modalSrc.connect(audioCtx_.destination);
+    _modalSrc.start(0, _modalOffset);
+    _modalPlayStart = audioCtx_.currentTime - _modalOffset;
+    document.getElementById('modalPlayBtn').textContent = '⏸';
+    _modalSrc.onended = () => {
+      if (!_modalSrc) return;
+      _modalSrc = null;
+      _modalOffset = 0;
+      cancelAnimationFrame(_modalRAF);
+      document.getElementById('modalPlayBtn').textContent = '▶';
+      document.getElementById('modalProgressFill').style.width  = '100%';
+      document.getElementById('modalAudioTime').textContent =
+        `${_modalDuration.toFixed(1)} / ${_modalDuration.toFixed(1)} s`;
+    };
+    function tick() {
+      if (!_modalSrc) return;
+      const elapsed = Math.min(audioCtx_.currentTime - _modalPlayStart, _modalDuration);
+      const pct = _modalDuration > 0 ? (elapsed / _modalDuration) * 100 : 0;
+      document.getElementById('modalProgressFill').style.width = pct + '%';
+      document.getElementById('modalAudioTime').textContent =
+        `${elapsed.toFixed(1)} / ${_modalDuration.toFixed(1)} s`;
+      _modalRAF = requestAnimationFrame(tick);
+    }
+    _modalRAF = requestAnimationFrame(tick);
+  }
+
+  function openPhraseModal(ph) {
+    const startT = ph.start_t, endT = ph.end_t;
+
+    // ── Extract PCM slice for this phrase ────────────────────────────
+    const startSmp = Math.floor(startT * SR16);
+    const endSmp   = Math.ceil(endT   * SR16);
+    const totalSmp = allAudioPCM.reduce((s, c) => s + c.length, 0);
+    const flat     = new Float32Array(totalSmp);
+    let pos = 0;
+    for (const c of allAudioPCM) { flat.set(c, pos); pos += c.length; }
+    _modalPCM      = flat.slice(Math.min(startSmp, flat.length),
+                                 Math.min(endSmp,   flat.length));
+    _modalDuration = _modalPCM.length / SR16;
+    _modalOffset   = 0;
+    _stopModalAudio();
+
+    // ── Filter frames / summaries to this phrase ─────────────────────
+    const eps    = 0.008;
+    const pFrames = allFrames.filter(f => f.t >= startT - eps && f.t <= endT + eps);
+    const pSumms  = allSummaries.filter(s => s.t >= startT - eps && s.t <= endT + eps);
+    const dur     = endT - startT;
+
+    // Time relative to phrase start
+    const rT  = obj => obj.t - startT;
+
+    // ── Show modal ──────────────────────────────────────────────────
+    document.getElementById('modalTitle').textContent =
+      `Phrase ${ph.idx}  ·  score ${ph.score}  ·  ${ph.rating}`;
+    document.getElementById('modalSubtitle').textContent =
+      `${startT.toFixed(2)} – ${endT.toFixed(2)} s`;
+    document.getElementById('modalPlayBtn').textContent  = '▶';
+    document.getElementById('modalProgressFill').style.width = '0%';
+    document.getElementById('modalAudioTime').textContent    =
+      `0.0 / ${_modalDuration.toFixed(1)} s`;
+    document.getElementById('phraseModal').style.display = 'flex';
+
+    // Destroy stale modal charts
+    Object.values(_modalCharts).forEach(c => { try { c.destroy(); } catch(_) {} });
+    _modalCharts = {};
+
+    // ── Shared options factory ───────────────────────────────────────
+    const sharedOpts = (yMin, yMax, yTickCb) => ({
+      responsive: true, maintainAspectRatio: false, animation: false,
+      plugins: { legend: { display: false },
+                 tooltip: { mode: 'index', intersect: false } },
+      scales: {
+        x: {
+          type: 'linear', min: 0, max: Math.max(dur, 0.1),
+          ticks: { callback: v => v.toFixed(1) + 's', maxTicksLimit: 6, color: '#555577' },
+          grid: { color: '#1e1e33' },
+        },
+        y: {
+          min: yMin, max: yMax,
+          ticks: { callback: yTickCb || (v => v), maxTicksLimit: 5, color: '#555577' },
+          grid: {
+            color: ctx => ctx.tick.value === 0 ? '#44445a' : '#1e1e33',
+          },
+        },
+      },
+    });
+
+    // ── 1. Pitch chart ──────────────────────────────────────────────
+    const f0Pts = pFrames.map(f => ({
+      x: rT(f), y: f.f0 > 0 ? f.f0 : null,
+      ed: f.et_dev_cents ?? 0, sc: !!f.scored,
+    }));
+    const centPts = pFrames.map(f => ({
+      x: rT(f), y: (f.central && f.central > 0) ? f.central : null,
+    }));
+    const f0Vals = f0Pts.map(p => p.y).filter(v => v != null && v > 0);
+    const f0Min  = f0Vals.length ? Math.max(50,   Math.min(...f0Vals) * 0.96) : 80;
+    const f0Max  = f0Vals.length ? Math.min(2000, Math.max(...f0Vals) * 1.04) : 600;
+
+    _modalCharts.pitch = new Chart(document.getElementById('modalPitchChart'), {
+      type: 'line',
+      data: { datasets: [
+        {
+          label: 'f0', data: f0Pts, parsing: false,
+          borderWidth: 2, pointRadius: 0, tension: 0, spanGaps: false,
+          segment: { borderColor: ctx => {
+            const p = ctx.p1?.raw; if (!p || p.y == null) return 'transparent';
+            if (!p.sc) return '#555577';
+            const d = Math.abs(p.ed ?? 0);
+            return d < 20 ? '#55efc4' : d < 40 ? '#fdcb6e' : '#e17055';
+          }},
+        },
+        {
+          label: 'central', data: centPts, parsing: false,
+          borderColor: '#ff9f4370', borderWidth: 1.5,
+          borderDash: [5, 3], pointRadius: 0, tension: 0.3,
+          spanGaps: true,
+        },
+      ]},
+      options: sharedOpts(f0Min, f0Max, v => Math.round(v) + ' Hz'),
+    });
+
+    // ── 2. Vibrato chart ────────────────────────────────────────────
+    const vibPts = pFrames.map(f => ({
+      x: rT(f),
+      y: (f.vib != null && !isNaN(f.vib)) ? f.vib : null,
+    }));
+    const vibVals = vibPts.map(p => p.y).filter(v => v != null);
+    const vibExt  = vibVals.length
+      ? Math.max(30, Math.ceil(Math.max(...vibVals.map(Math.abs)) * 1.15 / 10) * 10)
+      : 50;
+
+    _modalCharts.vibrato = new Chart(document.getElementById('modalVibratoChart'), {
+      type: 'line',
+      data: { datasets: [{
+        label: 'Vibrato (¢)', data: vibPts, parsing: false,
+        borderColor: '#a29bfe', borderWidth: 1.5,
+        pointRadius: 0, tension: 0, spanGaps: false,
+      }]},
+      options: sharedOpts(-vibExt, vibExt, v => v + '¢'),
+    });
+
+    // ── 3. Breathiness (CPP) chart ──────────────────────────────────
+    const cppPts = pSumms.map(s => ({ x: rT(s), y: s.cpp ?? 0 }));
+    const cppMax = cppPts.length
+      ? Math.max(12, Math.ceil(Math.max(...cppPts.map(p => p.y)) * 1.15))
+      : 15;
+
+    _modalCharts.breath = new Chart(document.getElementById('modalBreathChart'), {
+      type: 'line',
+      data: { datasets: [{
+        label: 'CPP', data: cppPts, parsing: false,
+        borderColor: '#55efc4', backgroundColor: '#55efc418',
+        borderWidth: 2, pointRadius: 3, tension: 0.35,
+        fill: true, spanGaps: true,
+      }]},
+      options: sharedOpts(0, cppMax, v => v.toFixed(1)),
+    });
+
+    // ── 4. Loudness (dBFS) chart ────────────────────────────────────
+    const dbfsPts = pSumms.map(s => ({ x: rT(s), y: s.dbfs ?? -80 }));
+    const dbfsMin = dbfsPts.length
+      ? Math.min(-65, Math.floor(Math.min(...dbfsPts.map(p => p.y)) * 1.05))
+      : -80;
+
+    _modalCharts.loudness = new Chart(document.getElementById('modalLoudnessChart'), {
+      type: 'line',
+      data: { datasets: [{
+        label: 'dBFS', data: dbfsPts, parsing: false,
+        borderColor: '#fdcb6e', backgroundColor: '#fdcb6e18',
+        borderWidth: 2, pointRadius: 3, tension: 0.35,
+        fill: true, spanGaps: true,
+      }]},
+      options: sharedOpts(dbfsMin, 0, v => v + ' dB'),
+    });
+  }
+
+  // Modal event listeners
+  document.getElementById('modalCloseBtn').addEventListener('click', _closeModal);
+  document.getElementById('phraseModal').addEventListener('click', e => {
+    if (e.target.id === 'phraseModal') _closeModal();
+  });
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') _closeModal();
+  });
+  document.getElementById('modalPlayBtn').addEventListener('click', _modalPlayToggle);
 
   const _tabColorMap = {
     pitch:       { scores: d => d.trend.pitch_scores,    color: '#7eb8f7', label: 'Pitch Accuracy' },
@@ -1276,10 +1627,11 @@
 
   // ── New Session ───────────────────────────────────────────────────
   document.getElementById('newSessionBtn').addEventListener('click', () => {
-    pitchData.length   = 0;
-    centralData.length = 0;
-    allFrames.length   = 0;
+    pitchData.length    = 0;
+    centralData.length  = 0;
+    allFrames.length    = 0;
     allSummaries.length = 0;
+    allAudioPCM.length  = 0;
     latestT = 0; startTs = null; startDate = null;
     lastVoicedF0 = null; lastVoicedCentral = null; lastChartVoicedAt = 0;
     _stablePitchCat = 'in-tune'; _lastCardSig = ''; _lastCardUpdate = 0; _lastVoicedAt = 0;
@@ -1342,7 +1694,9 @@
           resampleBuf = merged;
           while (resampleBuf.length >= FRAME) {
             if (_latencyMark === 0) _latencyMark = Date.now();
-            ws.send(resampleBuf.subarray(0, FRAME).buffer);
+            const chunk = resampleBuf.subarray(0, FRAME);
+            ws.send(chunk.buffer);
+            allAudioPCM.push(new Float32Array(chunk)); // buffer for replay
             resampleBuf = resampleBuf.slice(FRAME);
           }
         };
