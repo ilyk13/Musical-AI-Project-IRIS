@@ -23,6 +23,7 @@ import warnings
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -59,7 +60,7 @@ parser.add_argument("--seq-len", type=int, default=200)
 parser.add_argument("--num-workers", type=int, default=0)
 parser.add_argument("--w-vad", type=float, default=0.1)
 parser.add_argument("--w-pitch", type=float, default=5.0)
-parser.add_argument("--w-gesture", type=float, default=1.0)
+parser.add_argument("--w-gesture", type=float, default=3.0)
 parser.add_argument("--w-register", type=float, default=0.5)
 parser.add_argument("--w-dynamics", type=float, default=0.5)
 parser.add_argument("--pitch-sigma-bins", type=float, default=0.8)
@@ -124,6 +125,29 @@ class VocalSetDataset(Dataset):
         )
 
 
+def focal_cross_entropy(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    gamma: float = 2.0,
+    ignore_index: int = -1,
+) -> torch.Tensor:
+    """Focal loss for gesture classification.
+
+    Down-weights correctly-classified easy frames (mostly "steady") so the
+    model's gradient is driven by the harder, rarer vibrato and transition
+    examples.  gamma=2.0 is the standard value from the original paper.
+
+    Loss = -(1 - p_t)^gamma * log(p_t),  where p_t = softmax probability of
+    the correct class.
+    """
+    ce = F.cross_entropy(logits, targets, ignore_index=ignore_index, reduction="none")
+    valid = targets != ignore_index
+    if not valid.any():
+        return torch.zeros((), device=logits.device)
+    pt = torch.exp(-ce[valid])
+    return ((1.0 - pt) ** gamma * ce[valid]).mean()
+
+
 def train_one_epoch(model, loader, optimizer, scheduler, writer, epoch, device, args):
     model.train()
     bce_vad = nn.BCEWithLogitsLoss(reduction="none")
@@ -157,7 +181,7 @@ def train_one_epoch(model, loader, optimizer, scheduler, writer, epoch, device, 
         vad_weight = 0.5 * (1.0 - vad_t) + 3.0 * vad_t
         vad_loss = (vad_weight * bce_vad(vad_l.squeeze(-1), vad_t)).mean()
         pitch_loss = (vad_t.unsqueeze(-1) * bce_pitch(pitch_l, pitch_target)).mean()
-        gesture_loss = ce(gest_l.reshape(-1, gest_l.shape[-1]), gest_t.reshape(-1)).mean()
+        gesture_loss = focal_cross_entropy(gest_l.reshape(-1, gest_l.shape[-1]), gest_t.reshape(-1))
 
         reg_mask = reg_t >= 0
         if reg_mask.any():
