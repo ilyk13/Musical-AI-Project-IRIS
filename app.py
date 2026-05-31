@@ -280,7 +280,7 @@ def _extract(state: ClientState, chunk: np.ndarray,
                 for pf in prov:
                     state.raw_f0_history.append(float(pf))
                 raw_track = np.array(list(state.raw_f0_history), dtype=np.float32)
-                heuristic_gest = classify_gestures_live(raw_track)[-len(prov):]
+                heuristic_gest = classify_gestures_live(raw_track, posteriorgram=post)[-len(prov):]
 
                 if gesture_logits:
                     gest_arr = merge_gesture_predictions(

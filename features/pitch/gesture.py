@@ -41,7 +41,7 @@ def _interpolate_unvoiced(log_f0: np.ndarray, voiced: np.ndarray) -> np.ndarray:
 
 
 def detect_vibrato_frames(f0: np.ndarray, min_voiced: int = 25) -> np.ndarray:
-    """3–9 Hz modulation on the f0 track (live singing + deliberate oscillation)."""
+    """4.5–8 Hz modulation on the f0 track (genuine vibrato band, matches training labels)."""
     mask = np.zeros(len(f0), dtype=bool)
     voiced = f0 > 0
     if voiced.sum() < min_voiced:
@@ -53,22 +53,19 @@ def detect_vibrato_frames(f0: np.ndarray, min_voiced: int = 25) -> np.ndarray:
 
     sr_frame = 100.0
     nyq = sr_frame / 2.0
-    energy = np.zeros(len(f0), dtype=np.float64)
-    for lo_hz, hi_hz in ((3.0, 9.0), (4.5, 8.0)):
-        lo, hi = lo_hz / nyq, min(hi_hz / nyq, 0.99)
-        if lo >= hi:
-            continue
-        b, a = butter(2, [lo, hi], btype="band")
-        try:
-            mod = filtfilt(b, a, log_f0)
-            energy = np.maximum(energy, np.abs(mod))
-        except ValueError:
-            continue
+    lo, hi = 4.5 / nyq, 8.0 / nyq
+    b, a = butter(2, [lo, hi], btype="band")
+    try:
+        mod = filtfilt(b, a, log_f0)
+    except ValueError:
+        return mask
 
+    energy = np.abs(mod)
     if energy.max() <= 0:
         return mask
 
-    thr = np.percentile(energy[voiced], 40)
+    # 65th percentile matches training label generation more closely than 40th
+    thr = np.percentile(energy[voiced], 65)
     depth_thr = 0.012  # ~14 cents in log2 domain
     return (energy > max(thr, depth_thr)) & voiced
 
@@ -129,20 +126,90 @@ def detect_glissando_frames(
     return mask
 
 
-def classify_gestures_live(f0: np.ndarray) -> np.ndarray:
-    """Per-frame gesture labels from an f0 track (T,) in Hz."""
+def pitch_posterior_entropy(posterior: np.ndarray) -> np.ndarray:
+    """Normalized pitch posterior entropy — high value means model is uncertain.
+
+    A confident pitched note produces a narrow peak (low entropy); a frame
+    mid-transition produces a flat or bimodal posterior (high entropy). This
+    bridges the training/runtime gap: the model learns from expert CSV
+    transition annotations, and entropy spikes serve as a proxy at runtime.
+
+    Returns (T,) float array in [0, 1], normalized by log(num_bins).
+    """
+    p = posterior / (posterior.sum(axis=-1, keepdims=True) + 1e-10)
+    raw = -np.sum(p * np.log(p + 1e-10), axis=-1)
+    return raw / np.log(max(posterior.shape[-1], 2))
+
+
+# Minimum credible run length per gesture class (frames at 10 ms/frame).
+# Runs shorter than these are collapsed into their surrounding context.
+_MIN_DURATION_FRAMES: dict[int, int] = {
+    GESTURE_VIBRATO: 10,     # < 100 ms is noise — half a vibrato cycle at 5 Hz
+    GESTURE_TRANSITION: 3,   # allow brief 30 ms transitions
+    GESTURE_GLISSANDO: 6,    # at least 60 ms of sustained slide
+    GESTURE_STEADY: 5,       # prevent single-frame dropouts from steady
+}
+
+
+def enforce_min_duration(labels: np.ndarray) -> np.ndarray:
+    """Collapse runs shorter than the per-gesture minimum into their neighbors.
+
+    Scans the label sequence for runs that are too short to be credible (e.g.
+    a 2-frame "vibrato" burst, a single-frame "transition") and replaces them
+    with the label of the preceding frame (or the following frame at the start).
+    """
+    out = labels.copy()
+    i = 0
+    while i < len(out):
+        g = int(out[i])
+        j = i + 1
+        while j < len(out) and int(out[j]) == g:
+            j += 1
+        run_len = j - i
+        if run_len < _MIN_DURATION_FRAMES.get(g, 0):
+            fill = int(out[i - 1]) if i > 0 else (int(out[j]) if j < len(out) else GESTURE_STEADY)
+            out[i:j] = fill
+        i = j
+    return out
+
+
+def classify_gestures_live(
+    f0: np.ndarray,
+    posteriorgram: np.ndarray | None = None,
+    entropy_threshold: float = 0.62,
+) -> np.ndarray:
+    """Per-frame gesture labels from an f0 track (T,) in Hz.
+
+    Args:
+        f0: (T,) f0 track in Hz, 0 = unvoiced.
+        posteriorgram: optional (K, bins) pitch posterior for the last K frames
+            of f0.  When provided, high-entropy frames are added to the
+            transition mask — bridging the CSV-annotation gap at runtime.
+        entropy_threshold: normalized entropy above which a voiced frame is
+            treated as a transition (0–1 scale; 0.62 ≈ ~10× uniform over
+            narrow peak).
+    """
     f0 = np.asarray(f0, dtype=np.float64)
     n = len(f0)
     labels = np.full(n, GESTURE_STEADY, dtype=np.int8)
 
     transition = detect_transition_frames(f0)
+
+    if posteriorgram is not None and len(posteriorgram) > 0:
+        post_arr = np.asarray(posteriorgram, dtype=np.float32)
+        k = min(len(post_arr), n)
+        entropy = pitch_posterior_entropy(post_arr[:k])
+        voiced_tail = f0[n - k:] > 0
+        transition[n - k:] |= (entropy > entropy_threshold) & voiced_tail
+
     vibrato = detect_vibrato_frames(f0.astype(np.float32))
     glissando = detect_glissando_frames(f0, transition)
 
     labels[glissando & ~transition] = GESTURE_GLISSANDO
     labels[vibrato & ~transition & ~glissando] = GESTURE_VIBRATO
     labels[transition] = GESTURE_TRANSITION
-    return labels
+
+    return enforce_min_duration(labels)
 
 
 def provisional_f0_from_posteriors(posteriorgram: np.ndarray) -> np.ndarray:
