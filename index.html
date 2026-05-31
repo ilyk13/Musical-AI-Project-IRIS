@@ -186,6 +186,19 @@
       font-size: 0.58rem; color: var(--dim); margin-top: 3px;
     }
 
+    /* Note sub-label (shown during vibrato to clarify central pitch) */
+    .note-sub-lbl {
+      font-size: 0.58rem; text-align: center; letter-spacing: 1.5px;
+      text-transform: uppercase; min-height: 1em; margin-top: 1px;
+      color: var(--dim); transition: color 0.2s;
+    }
+    .note-sub-lbl.vibrato { color: var(--purple); opacity: 0.9; }
+
+    /* Vibrato mode: purple note, subtle pulsing border */
+    .note-display.vibrato-mode {
+      color: var(--purple);
+    }
+
     /* Loudness / Breathiness / Vibrato blocks */
     .fb-main {
       font-size: 1.55rem; font-weight: 700;
@@ -500,6 +513,10 @@
                 <div class="swatch-dashed"></div>
                 <span style="color:var(--orange);">central</span>
               </div>
+              <div class="legend-item" id="vibSineLegend" style="display:none;">
+                <div class="swatch" style="background:var(--purple);opacity:0.75;"></div>
+                <span style="color:var(--purple);">vibrato</span>
+              </div>
             </div>
             <div class="acc-legend">
               <span class="acc-dot" style="background:var(--green);"></span>
@@ -522,6 +539,7 @@
       <div class="fb-block">
         <div class="fb-label">Pitch Accuracy</div>
         <div class="note-display" id="noteDisplay">—</div>
+        <div class="note-sub-lbl" id="noteSubLbl"></div>
         <div class="et-dev dim" id="etDevText">—</div>
         <div>
           <div class="tuner-track">
@@ -729,6 +747,8 @@
   // ── Live state ────────────────────────────────────────────────────
   let pitchData    = [];
   let centralData  = [];
+  let vibratoSineData = [];   // synthesised vibrato sine wave overlay
+  let vibratoPhase    = 0;    // phase accumulator (radians) for sine wave
   let latestT      = 0;
   let startTs      = null;
   let startDate    = null;
@@ -761,6 +781,27 @@
     if (score >= 82) return '#55efc4';
     if (score >= 62) return '#fdcb6e';
     return '#e17055';
+  }
+
+  // ── Vibrato quality rating ─────────────────────────────────────────
+  // Returns 'good' | 'warn' | 'bad' based on rate and depth targets.
+  function vibratoQuality(rateHz, depthCents) {
+    if (rateHz == null || depthCents == null) return 'warn';
+    const goodRate  = rateHz >= 5.0 && rateHz <= 7.0;
+    const goodDepth = depthCents >= 25 && depthCents <= 75;
+    if (goodRate && goodDepth) return 'good';
+    if (rateHz >= 4.0 && rateHz <= 8.0 && depthCents >= 15) return 'warn';
+    return 'bad';
+  }
+
+  // Segment color for the vibrato sine wave — purple/yellow/red by quality.
+  function vibratoSineSegmentColor(ctx) {
+    const raw = ctx.p1?.raw;
+    if (!raw || raw.y == null) return 'transparent';
+    const q = raw.quality || 'warn';
+    if (q === 'good') return '#a29bfedd';
+    if (q === 'warn') return '#fdcb6edd';
+    return '#e17055dd';
   }
 
   // ── Segment color for color-coded pitch line ───────────────────────
@@ -805,6 +846,18 @@
           tension: 0.4,
           order: 1,
         },
+        {
+          // Vibrato sine wave — synthesised from measured rate + depth,
+          // colour-coded by quality (purple=good, yellow=warn, red=bad).
+          data: vibratoSineData,
+          borderWidth: 2,
+          pointRadius: 0,
+          spanGaps: false,
+          tension: 0.4,
+          backgroundColor: 'transparent',
+          order: 0,
+          segment: { borderColor: vibratoSineSegmentColor },
+        },
       ],
     },
     options: {
@@ -847,10 +900,19 @@
 
   // ── Live feedback block updaters ──────────────────────────────────
   function updatePitchBlock(s, voiced) {
-    const noteEl = document.getElementById('noteDisplay');
-    const devEl  = document.getElementById('etDevText');
-    const needle = document.getElementById('tunerNeedle');
+    const noteEl   = document.getElementById('noteDisplay');
+    const subLbl   = document.getElementById('noteSubLbl');
+    const devEl    = document.getElementById('etDevText');
+    const needle   = document.getElementById('tunerNeedle');
+    const vibLegend = document.getElementById('vibSineLegend');
+    const isVib    = voiced && s.gesture === 'vibrato';
+
     noteEl.textContent = voiced ? s.et_note : '—';
+    noteEl.className   = 'note-display' + (isVib ? ' vibrato-mode' : '');
+    subLbl.textContent = isVib ? 'vibrato center' : '';
+    subLbl.className   = 'note-sub-lbl' + (isVib ? ' vibrato' : '');
+    vibLegend.style.display = isVib ? '' : 'none';
+
     if (voiced) {
       const dev  = s.et_dev_cents;
       const pct  = Math.max(0, Math.min(100, (dev + 50) / 100 * 100));
@@ -1078,13 +1140,29 @@
         }
         pitchData.push({ x: f.t, y: yF0,     voiced: isVoiced, etDev, scored, gesture });
         centralData.push({ x: f.t, y: yCentral });
+
+        // Vibrato sine wave: synthesise using current summary rate + depth.
+        // Phase advances 2π·rate·10ms each frame; resets when leaving vibrato.
+        if (isVoiced && f.gesture === 'vibrato' && f.central && f.central > 0
+            && s.vib_rate_hz != null && s.vib_depth_cents != null) {
+          vibratoPhase += 2 * Math.PI * s.vib_rate_hz * 0.01;
+          const ampCents = s.vib_depth_cents / 2;
+          const sineHz   = f.central * Math.pow(2, ampCents * Math.sin(vibratoPhase) / 1200);
+          const quality  = vibratoQuality(s.vib_rate_hz, s.vib_depth_cents);
+          vibratoSineData.push({ x: f.t, y: sineHz, quality });
+        } else {
+          vibratoPhase = 0;   // reset so next vibrato entry starts cleanly
+          vibratoSineData.push({ x: f.t, y: null });
+        }
+
         if (f.t > latestT) latestT = f.t;
       });
 
       // Trim live chart window
       const pMin = latestT - PITCH_WIN;
-      while (pitchData.length   && pitchData[0].x   < pMin) pitchData.shift();
-      while (centralData.length && centralData[0].x < pMin) centralData.shift();
+      while (pitchData.length        && pitchData[0].x        < pMin) pitchData.shift();
+      while (centralData.length      && centralData[0].x      < pMin) centralData.shift();
+      while (vibratoSineData.length  && vibratoSineData[0].x  < pMin) vibratoSineData.shift();
       pitchChart.options.scales.x.min = Math.max(0, latestT - PITCH_WIN);
       pitchChart.options.scales.x.max = Math.max(latestT, PITCH_WIN);
       pitchChart.update('none');
