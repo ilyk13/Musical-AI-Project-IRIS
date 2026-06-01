@@ -30,13 +30,19 @@ from scipy.signal import savgol_filter
 sys.path.insert(0, str(Path(__file__).parent))
 
 from features.pitch.gesture import (
+    GESTURE_GLISSANDO,
     GESTURE_STEADY,
+    GESTURE_VIBRATO,
     classify_gestures_live,
     gesture_name,
     is_scored_gesture,
     merge_gesture_predictions,
     overlay_vibrato_from_deviation,
     provisional_f0_from_posteriors,
+    boost_glissando_labels,
+    coalesce_glissando_labels,
+    reconcile_false_glissando,
+    reconcile_false_vibrato,
     smooth_gesture_label,
 )
 from features.pitch.nanopitch import (
@@ -46,11 +52,13 @@ from features.pitch.nanopitch import (
 from features.pitch.central_pitch import compute_central_pitch
 from features.dynamics.dynamic_class import classify_dynamic
 from features.breath.cpp import compute_cpp
+from features.breath.phrase import PhraseTracker, breath_window_from_roll
 from features.breath.spectral_tilt import compute_spectral_tilt_slope
 from features.vibrato.bandpass import bandpass_vibrato
 from features.vibrato.parameters import extract_vibrato_params
 from features.pitch.pitch_drift import analyze_drift, aggregate_drift_score
-from model.nanopitch import viterbi_stream_gesture
+from model.nanopitch import viterbi_stream
+from model.breath_cnn import BreathCNN, DEFAULT_WINDOW as BREATH_WINDOW
 
 # ── Constants ──────────────────────────────────────────────────────────
 SR             = 16_000
@@ -63,23 +71,32 @@ ROLLING_FRAMES = ROLLING_SECS * 100   # 300
 MIN_AUDIO_SAMPS = NP_WIN            # 400 samples = first mel frame
 MIN_VIB_FRAMES  = 120
 # How often to run the slower DSP operations (in chunks)
-CPP_EVERY   = 15   # every ~15 chunks ≈ 350 ms
-VIB_EVERY   = 15   # every ~15 chunks ≈ 350 ms
+CPP_EVERY   = 30   # every ~30 chunks ≈ 300 ms — keeps realtime proc under budget
+VIB_EVERY   = 30
 
 app = FastAPI()
 
 # ── Model — loaded once at startup ────────────────────────────────────
-# Checkpoint search order: env var, local IRIS training run, NanoPitchFork sibling
+# Checkpoint search order: env var, then candidates below (first existing wins).
+# exp6 is the production NanoPitch checkpoint (WASM parity). exp4-cosine-logits
+# outputs logits that never exceed ~0.27 after sigmoid — Viterbi stays unvoiced.
 NANOPITCH_CHECKPOINT_CANDIDATES = [
     Path(__file__).parent.parent / "NanoPitchFork" / "training" / "runs" / "exp6" / "checkpoints" / "best.pth",
     Path(__file__).parent / "runs" / "exp1" / "checkpoints" / "best.pth",
     Path(__file__).parent.parent / "NanoPitchFork" / "training" / "runs" / "exp4-cosine-logits" / "checkpoints" / "best.pth",
 ]
 NANOPITCH_PLUS_CANDIDATES = [
+    Path(__file__).parent / "runs" / "vocalset_plus_v3" / "checkpoints" / "best.pth",
     Path(__file__).parent / "runs" / "vocalset_plus" / "checkpoints" / "best.pth",
 ]
+BREATH_CHECKPOINT_CANDIDATES = [
+    Path(__file__).parent / "runs" / "breath_cnn" / "checkpoints" / "best.pth",
+]
 _extractor: NanoPitchExtractor | None = None
+_breath_model: BreathCNN | None = None
+_breath_window: int = BREATH_WINDOW
 _checkpoint_used: Path | None = None
+_breath_checkpoint_used: Path | None = None
 _gesture_source: str = "heuristic"  # heuristic | model
 
 
@@ -93,6 +110,29 @@ def _resolve_plus_checkpoint() -> Path | None:
         if p.exists():
             return p
     return None
+
+
+def _resolve_breath_checkpoint() -> Path | None:
+    import os
+    env = os.environ.get("BREATH_CHECKPOINT")
+    if env:
+        p = Path(env).expanduser()
+        return p if p.exists() else None
+    for p in BREATH_CHECKPOINT_CANDIDATES:
+        if p.exists():
+            return p
+    return None
+
+
+def _load_breath_model(ckpt_path: Path) -> BreathCNN:
+    global _breath_window
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    window = int(ckpt.get("window_size", BREATH_WINDOW))
+    model = BreathCNN(window_size=window)
+    model.load_state_dict(ckpt["state_dict"])
+    model.eval()
+    _breath_window = window
+    return model
 
 
 def _resolve_checkpoint() -> Path | None:
@@ -109,10 +149,18 @@ def _resolve_checkpoint() -> Path | None:
     return None
 
 
-def _load_and_warmup(pitch_ckpt: str | None, plus_ckpt: str | None) -> NanoPitchExtractor:
-    """Load pitch model; optionally replace with NanoPitchPlus for gesture head."""
+def _load_and_warmup(
+    pitch_ckpt: str | None,
+    plus_ckpt: str | None,
+    *,
+    use_plus_head: bool = False,
+) -> NanoPitchExtractor:
+    """Load pitch model; optionally attach Plus gesture head without replacing pitch weights."""
     global _gesture_source
-    if plus_ckpt:
+    if use_plus_head and plus_ckpt and pitch_ckpt:
+        ext = NanoPitchExtractor.from_hybrid_checkpoints(pitch_ckpt, plus_ckpt)
+        _gesture_source = "model"
+    elif use_plus_head and plus_ckpt:
         ext = NanoPitchExtractor.from_checkpoint(plus_ckpt, prefer_plus=True)
         _gesture_source = "model"
     elif pitch_ckpt:
@@ -134,13 +182,31 @@ def _load_and_warmup(pitch_ckpt: str | None, plus_ckpt: str | None) -> NanoPitch
 
 @app.on_event("startup")
 async def _startup() -> None:
-    global _extractor, _checkpoint_used
-    plus_ckpt = _resolve_plus_checkpoint()
+    global _extractor, _checkpoint_used, _breath_model, _breath_checkpoint_used
+    import os
+    use_plus = os.environ.get("NANOPITCH_USE_PLUS", "").lower() in ("1", "true", "yes")
+    plus_ckpt = _resolve_plus_checkpoint() if use_plus else None
     pitch_ckpt = _resolve_checkpoint()
-    if plus_ckpt:
+    if pitch_ckpt and "exp4-cosine-logits" in str(pitch_ckpt):
+        print(
+            "[WARNING] exp4-cosine-logits produces sub-threshold pitch posteriors "
+            "(no voiced frames). Use exp6 for live pitch, or set NANOPITCH_CHECKPOINT "
+            "to .../exp6/checkpoints/best.pth"
+        )
+
+    if use_plus and plus_ckpt and pitch_ckpt:
         _checkpoint_used = plus_ckpt
         _extractor = await asyncio.to_thread(
-            _load_and_warmup, None, str(plus_ckpt),
+            _load_and_warmup, str(pitch_ckpt), str(plus_ckpt), use_plus_head=True,
+        )
+        print(
+            f"Hybrid ready — pitch: {pitch_ckpt}  "
+            f"gesture head: {plus_ckpt} (source: model)"
+        )
+    elif use_plus and plus_ckpt:
+        _checkpoint_used = plus_ckpt
+        _extractor = await asyncio.to_thread(
+            _load_and_warmup, None, str(plus_ckpt), use_plus_head=True,
         )
         print(f"NanoPitchPlus ready — {plus_ckpt} (gesture head: model)")
     elif pitch_ckpt:
@@ -152,6 +218,14 @@ async def _startup() -> None:
     else:
         _extractor = await asyncio.to_thread(_load_and_warmup, None, None)
         print("NanoPitch ready — random weights (gesture: heuristic f0)")
+
+    breath_ckpt = _resolve_breath_checkpoint()
+    if breath_ckpt:
+        _breath_checkpoint_used = breath_ckpt
+        _breath_model = await asyncio.to_thread(_load_breath_model, breath_ckpt)
+        print(f"BreathCNN ready — {breath_ckpt} (live phrase boundaries)")
+    else:
+        print("BreathCNN not loaded — phrasing uses silence gaps only")
 
 
 _NOTE_NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B']
@@ -202,8 +276,88 @@ class ClientState:
     viterbi_state:   np.ndarray | None = field(default=None)
     # Vibrato parameters (updated every VIB_EVERY chunks)
     last_vib_rate_hz:     float = float('nan')
+    last_has_vibrato:     bool = False
     last_vib_depth_cents: float = float('nan')
     last_vib_consistency: float = 0.0
+    phrase_tracker:     PhraseTracker = field(default_factory=PhraseTracker)
+    phrase_info:        dict = field(default_factory=dict)
+    phrase_boundaries:  list = field(default_factory=list)
+
+
+def _pitch_dev_cents(hz: float, central_hz: float | None) -> float:
+    """Drift from central pitch (cents); falls back to ET deviation when central unknown."""
+    if hz <= 0:
+        return 0.0
+    if central_hz is not None and central_hz > 0 and not np.isnan(central_hz):
+        return abs(1200.0 * np.log2(hz / central_hz + 1e-10))
+    _, _, et_dev = _hz_to_et(hz)
+    return abs(et_dev)
+
+
+def _track_phrases(
+    state: ClientState,
+    buf: np.ndarray,
+    frame_indices: list[int],
+    f0_arr: np.ndarray,
+    gesture_arr: np.ndarray,
+    hop_s: float,
+    central_arr: np.ndarray | None = None,
+) -> tuple[list[int], dict, list[dict]]:
+    """Update phrase tracker; return per-frame phrase ids, summary, and boundary events."""
+    n = len(f0_arr)
+    if n == 0:
+        return [], state.phrase_tracker.snapshot(), []
+
+    probs = np.zeros(n, dtype=np.float32)
+    if _breath_model is not None and len(frame_indices) == n:
+        windows = np.stack([
+            breath_window_from_roll(
+                buf, state.samples_rx, fi,
+                window_size=_breath_window, hop=HOP_LENGTH, buf_index=_buf_index,
+            )
+            for fi in frame_indices
+        ])
+        with torch.no_grad():
+            probs = _breath_model(
+                torch.from_numpy(windows).unsqueeze(0),
+            )[0, :, 0].cpu().numpy()
+
+    phrase_ids: list[int] = []
+    boundary_events: list[dict] = []
+    last_info = state.phrase_tracker.snapshot()
+    for i in range(n):
+        t = state.elapsed - (n - i - 1) * hop_s
+        f0 = float(f0_arr[i])
+        g = int(gesture_arr[i]) if i < len(gesture_arr) else GESTURE_STEADY
+        central = None
+        if central_arr is not None and i < len(central_arr):
+            c = float(central_arr[i])
+            if c > 0 and not np.isnan(c):
+                central = c
+        pitch_dev = _pitch_dev_cents(f0, central)
+        last_info = state.phrase_tracker.update(
+            float(probs[i]),
+            f0 > 0,
+            t,
+            scored=is_scored_gesture(g),
+            et_dev_cents=pitch_dev,
+            gesture=g,
+            cpp=state.last_cpp,
+            vib_rate_hz=state.last_vib_rate_hz,
+            vib_depth_cents=state.last_vib_depth_cents,
+            vib_consistency=state.last_vib_consistency,
+        )
+        phrase_ids.append(last_info["phrase_id"])
+        boundary = last_info.get("phrase_boundary")
+        if boundary in ("start", "end"):
+            boundary_events.append({
+                "event": boundary,
+                "phrase_id": last_info.get("phrase_id", 0),
+                "t": round(t, 3),
+                "feedback": last_info.get("phrase_feedback"),
+            })
+
+    return phrase_ids, last_info, boundary_events
 
 
 # ── Feature extraction ─────────────────────────────────────────────────
@@ -229,6 +383,7 @@ def _extract(state: ClientState, chunk: np.ndarray,
     # ── Pitch — streaming NanoPitch + gesture-aware Viterbi ─────────
     f0_arr = np.zeros(0, dtype=np.float32)
     gesture_arr = np.zeros(0, dtype=np.int8)
+    frame_indices: list[int] = []
 
     if state.samples_rx >= MIN_AUDIO_SAMPS and _extractor is not None:
         try:
@@ -271,6 +426,7 @@ def _extract(state: ClientState, chunk: np.ndarray,
                 state.model_frame_n += 1
                 posteriors.append(pitch_f[0, 0].cpu().numpy())
                 frame_ids.append(state.model_frame_n)
+                frame_indices.append(frame_idx)
 
             if posteriors:
                 post = np.stack(posteriors)
@@ -290,8 +446,12 @@ def _extract(state: ClientState, chunk: np.ndarray,
                 else:
                     gest_arr = heuristic_gest
 
-                f0_raw, state.viterbi_state = viterbi_stream_gesture(
-                    post, gest_arr, state.viterbi_state,
+                # Standard ±12-bin Viterbi for f0 (matches NanoPitchFork WASM).
+                # Gesture labels only drive UI/scoring — not pitch decode.
+                # Gesture-aware Viterbi widens paths on vibrato/transition and
+                # was dropping voiced frames when labels were noisy.
+                f0_raw, state.viterbi_state = viterbi_stream(
+                    post, state.viterbi_state,
                 )
                 for i, frame_n in enumerate(frame_ids):
                     if frame_n <= NC_CONV_CONTEXT:
@@ -315,10 +475,9 @@ def _extract(state: ClientState, chunk: np.ndarray,
     elif len(gesture_arr) != n_new:
         gesture_arr = np.resize(gesture_arr, n_new)
 
-    # ── Update rolling f0 + gesture history ───────────────────────
-    for f, g in zip(f0_arr, gesture_arr):
+    # ── Update rolling f0 history (gestures appended after overlay) ───
+    for f in f0_arr:
         state.f0_history.append(float(f))
-        state.gesture_history.append(int(g))
 
     # ── Central pitch (per-frame) ──────────────────────────────────
     f0_roll     = np.array(list(state.f0_history), dtype=np.float32)
@@ -358,6 +517,7 @@ def _extract(state: ClientState, chunk: np.ndarray,
             vp = extract_vibrato_params(state.cached_vib, frame_rate_hz=100.0)
             if vp is not None:
                 state.last_vib_consistency = vp.consistency
+                state.last_has_vibrato = vp.has_vibrato
                 if vp.has_vibrato:
                     state.last_vib_rate_hz     = vp.rate_hz
                     state.last_vib_depth_cents = vp.depth_cents
@@ -370,24 +530,68 @@ def _extract(state: ClientState, chunk: np.ndarray,
         else np.zeros(n_new, dtype=np.float32)
     )
 
+    # Viterbi f0 is smoother than raw argmax — recover slides the slope detector misses.
+    if len(f0_arr) and np.any(f0_arr > 0):
+        vit_track = np.array(list(state.f0_history) + list(f0_arr), dtype=np.float32)
+        vit_seg = vit_track[-len(f0_arr):]
+        gesture_arr = boost_glissando_labels(
+            gesture_arr, vit_seg,
+            vibrato_mask=(gesture_arr == GESTURE_VIBRATO),
+        ).astype(np.int8)
+
     # Align gesture labels with vibrato deviation chart (same band-pass signal).
     if len(vib_latest) and np.any(f0_arr > 0):
         gesture_arr = overlay_vibrato_from_deviation(
             gesture_arr, f0_arr, vib_latest,
         ).astype(np.int8)
-        if n_new > 0 and len(state.gesture_history) >= n_new:
-            hist = list(state.gesture_history)
-            for i in range(n_new):
-                hist[-n_new + i] = int(gesture_arr[i])
-            state.gesture_history = deque(hist, maxlen=ROLLING_FRAMES)
+        gesture_arr = reconcile_false_vibrato(
+            gesture_arr, f0_arr, vib_latest,
+        ).astype(np.int8)
+        gesture_arr = reconcile_false_glissando(
+            gesture_arr, f0_arr, vib_latest,
+        ).astype(np.int8)
+        gesture_arr = coalesce_glissando_labels(gesture_arr).astype(np.int8)
+        gesture_arr = boost_glissando_labels(
+            gesture_arr, f0_arr,
+            vibrato_mask=(gesture_arr == GESTURE_VIBRATO),
+        ).astype(np.int8)
+
+    for g in gesture_arr:
+        state.gesture_history.append(int(g))
+
+    # Phrase scoring uses final gestures + central-relative pitch drift.
+    phrase_ids, state.phrase_info, phrase_boundary_events = _track_phrases(
+        state, buf, frame_indices, f0_arr, gesture_arr, hop_s,
+        central_arr=central_latest,
+    )
+    if len(phrase_ids) < n_new:
+        phrase_ids = phrase_ids + [0] * (n_new - len(phrase_ids))
+    elif len(phrase_ids) > n_new:
+        phrase_ids = phrase_ids[:n_new]
 
     # ── ET deviation + gesture display ───────────────────────────────
-    f0_now              = float(f0_arr[-1]) if len(f0_arr) and f0_arr[-1] > 0 else 0.0
-    gesture_now         = int(gesture_arr[-1]) if len(gesture_arr) else GESTURE_STEADY
+    # Use the last voiced frame in this batch for summary (not the trailing
+    # unvoiced tail), so brief decode gaps don't wipe the live readout.
+    f0_now = 0.0
+    gesture_now = GESTURE_STEADY
+    for i in range(len(f0_arr) - 1, -1, -1):
+        if f0_arr[i] > 0:
+            f0_now = float(f0_arr[i])
+            gesture_now = int(gesture_arr[i]) if i < len(gesture_arr) else GESTURE_STEADY
+            break
     vib_display_win     = min(45, len(state.cached_vib))
+    gesture_hist        = np.array(list(state.gesture_history)[-vib_display_win:], dtype=np.int8)
     gesture_display     = smooth_gesture_label(
-        np.array(list(state.gesture_history)[-vib_display_win:], dtype=np.int8),
+        gesture_hist,
         vib_recent=state.cached_vib[-vib_display_win:],
+    )
+    recent_slice        = gesture_hist[-45:]
+    win_len             = max(len(recent_slice), 1)
+    glissando_active    = (
+        int(np.sum(recent_slice == GESTURE_GLISSANDO)) >= max(8, int(win_len * 0.14))
+    )
+    vibrato_active      = (
+        int(np.sum(recent_slice == GESTURE_VIBRATO)) >= max(7, int(win_len * 0.12))
     )
     _, et_note, et_dev = _hz_to_et(f0_now)
 
@@ -405,10 +609,42 @@ def _extract(state: ClientState, chunk: np.ndarray,
                        if float(f) > 0 and not np.isnan(vi) else None,
             "gesture": gesture_name(g),
             "scored":  is_scored_gesture(g),
+            "phrase_id": int(phrase_ids[i]) if i < len(phrase_ids) else 0,
         })
+
+    pi = state.phrase_info or state.phrase_tracker.snapshot()
+    pf = pi.get("phrase_feedback")
+    boundary = pi.get("phrase_boundary")
+
+    phrase_events_batch: list[dict] = []
+    for be in phrase_boundary_events:
+        ev = {
+            "event": be["event"],
+            "phrase_id": be.get("phrase_id", 0),
+            "t": be.get("t", state.elapsed),
+            "feedback": be.get("feedback") if be["event"] == "end" else None,
+        }
+        phrase_events_batch.append(ev)
+        state.phrase_boundaries.append(ev)
+
+    phrase_event = phrase_events_batch[-1] if phrase_events_batch else None
+    if phrase_event is None and boundary in ("start", "end"):
+        phrase_event = {
+            "event": boundary,
+            "phrase_id": pi.get("phrase_id", 0),
+            "t": round(
+                pi.get("phrase_start_t", 0.0) if boundary == "start"
+                else state.elapsed,
+                3,
+            ),
+            "feedback": pf if boundary == "end" else None,
+        }
+        state.phrase_boundaries.append(phrase_event)
 
     return {
         "frames": frames,
+        "phrase_events": phrase_events_batch,
+        "phrase_event": phrase_event,
         "summary": {
             "dbfs":             round(state.last_dbfs, 1),
             "dynamic":          state.last_dynamic,
@@ -418,10 +654,24 @@ def _extract(state: ClientState, chunk: np.ndarray,
             "et_dev_cents":     round(et_dev, 1),
             "gesture":          gesture_name(gesture_display),
             "gesture_raw":      gesture_name(gesture_now),
+            "glissando_active": glissando_active,
+            "vibrato_active":   vibrato_active,
             "gesture_source":   _gesture_source,
             "vib_rate_hz":      None if np.isnan(state.last_vib_rate_hz)     else round(state.last_vib_rate_hz, 2),
+            "has_vibrato":      state.last_has_vibrato,
             "vib_depth_cents":  None if np.isnan(state.last_vib_depth_cents) else round(state.last_vib_depth_cents, 1),
             "vib_consistency":  round(state.last_vib_consistency, 3),
+            "phrase_id":        pi.get("phrase_id", 0),
+            "phrase_start_t":   pi.get("phrase_start_t", 0.0),
+            "phrase_boundary":  boundary,
+            "breath_prob":      pi.get("breath_prob", 0.0),
+            "in_phrase":        pi.get("in_phrase", False),
+            "pending_phrase":   pi.get("pending_phrase", False),
+            "phrase_singing":   bool(
+                pi.get("in_phrase") or pi.get("pending_phrase")
+            ) and state.phrase_tracker.phrase_voiced_frames > 0,
+            "phrase_feedback":  pf,
+            "phrase_boundaries": state.phrase_boundaries[-30:],
         },
     }
 
@@ -432,10 +682,11 @@ async def ws_endpoint(ws: WebSocket) -> None:
     await ws.accept()
     print("Browser connected")
     state   = ClientState()
-    # Queue between recv and proc tasks.  maxsize=2 means if processing falls
-    # behind, the oldest unprocessed chunk is dropped so we always work on
-    # the most recent audio rather than building an ever-growing backlog.
-    q: asyncio.Queue = asyncio.Queue(maxsize=2)
+    # Process every chunk in order — dropping desyncs GRU/Viterbi from real time.
+    q: asyncio.Queue = asyncio.Queue()
+    _MAX_COALESCE = 12   # up to ~120 ms per inference when catching up
+    _BACKLOG_WARN = 50   # log if we fall >500 ms behind
+    _backlog_warned = False
 
     def _ingest(raw: bytes) -> np.ndarray | None:
         """Resample and roll the audio buffer.  Called from the recv task."""
@@ -478,31 +729,47 @@ async def ws_endpoint(ws: WebSocket) -> None:
                 chunk = _ingest(raw)
                 if chunk is None:
                     continue
-                # Drop the oldest pending chunk if processing is behind
-                if q.full():
-                    with contextlib.suppress(asyncio.QueueEmpty):
-                        q.get_nowait()
                 await q.put(chunk)
+                nonlocal _backlog_warned
+                if not _backlog_warned and q.qsize() >= _BACKLOG_WARN:
+                    print(f"  [WARNING] Processing backlog: {q.qsize()} chunks (~{q.qsize() * 10} ms)")
+                    _backlog_warned = True
         finally:
             with contextlib.suppress(asyncio.QueueFull):
                 q.put_nowait(None)           # signal EOF to proc task
 
     async def _proc_task() -> None:
-        """Process the latest chunk and send results.  Runs serially."""
+        """Process every audio chunk in order; coalesce backlog to catch up."""
         while True:
-            chunk = await q.get()
-            if chunk is None:
+            first = await q.get()
+            if first is None:
                 break
-            # Snapshot the rolling buffer in the event-loop thread
-            # before handing off to the worker thread (no race with _ingest).
+            chunks = [first]
+            eof = False
+            while len(chunks) < _MAX_COALESCE:
+                try:
+                    nxt = q.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if nxt is None:
+                    eof = True
+                    break
+                chunks.append(nxt)
+            chunk = np.concatenate(chunks) if len(chunks) > 1 else chunks[0]
             audio_snap = state.audio_roll.copy()
             try:
                 result = await asyncio.to_thread(_extract, state, chunk, audio_snap)
                 await ws.send_text(json.dumps(result))
             except WebSocketDisconnect:
                 break
+            except RuntimeError as e:
+                if "websocket.send" in str(e):
+                    break
+                print(f"  Error: {e}")
             except Exception as e:
                 print(f"  Error: {e}")
+            if eof:
+                break
 
     recv = asyncio.create_task(_recv_task())
     proc = asyncio.create_task(_proc_task())

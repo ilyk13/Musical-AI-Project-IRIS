@@ -1,0 +1,154 @@
+{
+  "meta": {
+    "epoch": 10,
+    "train_loss": 1.0846910973389943,
+    "checkpoint": "/Users/krzywonos/Desktop/IRIS/runs/vocalset_plus_v2/checkpoints/best.pth"
+  },
+  "results": {
+    "n_clips": 188,
+    "n_frames": 250664,
+    "gesture": {
+      "accuracy": 0.1176,
+      "accuracy_voiced_frames": 0.4683,
+      "majority_class": "steady",
+      "majority_baseline_accuracy": 0.7489,
+      "macro_f1": 0.1243,
+      "per_class": {
+        "steady": {
+          "precision": 0.7273,
+          "recall": 0.0,
+          "f1": 0.0001,
+          "support": 187733
+        },
+        "vibrato": {
+          "precision": 0.2221,
+          "recall": 0.4907,
+          "f1": 0.3057,
+          "support": 54011
+        },
+        "glissando": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "support": 0
+        },
+        "transition": {
+          "precision": 0.0373,
+          "recall": 0.333,
+          "f1": 0.067,
+          "support": 8920
+        }
+      },
+      "confusion_matrix": [
+        [
+          8,
+          88630,
+          38405,
+          60690
+        ],
+        [
+          3,
+          26502,
+          11446,
+          16060
+        ],
+        [
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          4216,
+          1734,
+          2970
+        ]
+      ],
+      "class_counts_true": {
+        "steady": 187733,
+        "vibrato": 54011,
+        "glissando": 0,
+        "transition": 8920
+      }
+    },
+    "pitch": {
+      "rpa_standard_viterbi": 0.7091,
+      "rpa_gesture_viterbi": 0.7086,
+      "vdr_standard_viterbi": 0.9258,
+      "vdr_gesture_viterbi": 0.9273
+    },
+    "register": {
+      "accuracy": 0.0201,
+      "macro_f1": 0.0393,
+      "per_class": {
+        "chest": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "support": 0
+        },
+        "mixed": {
+          "precision": 1.0,
+          "recall": 0.0201,
+          "f1": 0.0393,
+          "support": 250664
+        },
+        "head": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "support": 0
+        },
+        "falsetto": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "support": 0
+        }
+      }
+    },
+    "dynamics": {
+      "accuracy": 0.5883,
+      "macro_f1": 0.1235,
+      "per_class": {
+        "pp": {
+          "precision": 0.5883,
+          "recall": 1.0,
+          "f1": 0.7408,
+          "support": 82726
+        },
+        "p": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "support": 34361
+        },
+        "mp": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "support": 13986
+        },
+        "mf": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "support": 5023
+        },
+        "f": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "support": 1698
+        },
+        "ff": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "support": 2827
+        }
+      }
+    }
+  }
+}

@@ -178,7 +178,7 @@
     .tuner-needle {
       position: absolute; top: -3px; width: 3px; height: 17px;
       background: white; border-radius: 2px; transform: translateX(-50%);
-      left: 50%; transition: left 0.08s linear;
+      left: 50%; transition: left 0.22s ease-out;
       box-shadow: 0 0 4px rgba(255,255,255,0.5);
     }
     .tuner-labels {
@@ -193,6 +193,7 @@
       color: var(--dim); transition: color 0.2s;
     }
     .note-sub-lbl.vibrato { color: var(--purple); opacity: 0.9; }
+    .note-sub-lbl.glissando { color: var(--orange); opacity: 0.9; }
 
     /* Vibrato mode: purple note, subtle pulsing border */
     .note-display.vibrato-mode {
@@ -238,6 +239,21 @@
     .coaching-card.tip  .card-icon { background: #a29bfe22; color: var(--purple); }
     .card-content { flex: 1; }
     .card-title { font-size: 0.8rem; font-weight: 700; line-height: 1.2; }
+    .coaching-card.phrase-review .card-title {
+      display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    }
+    .phrase-score-badge {
+      display: inline-flex; align-items: center; justify-content: center;
+      min-width: 2.1rem; padding: 2px 8px; border-radius: 999px;
+      font-size: 0.82rem; font-weight: 700; letter-spacing: 0.02em;
+      background: #55efc422; color: var(--green);
+    }
+    .coaching-card.phrase-review.warn .phrase-score-badge {
+      background: #fdcb6e22; color: var(--yellow);
+    }
+    .phrase-score-breakdown {
+      font-size: 0.72rem; color: var(--dim); margin-top: 2px;
+    }
     .coaching-card.good .card-title { color: var(--green); }
     .coaching-card.warn .card-title { color: var(--yellow); }
     .coaching-card.tip  .card-title { color: var(--purple); }
@@ -580,6 +596,13 @@
         </div>
       </div>
 
+      <!-- Phrase -->
+      <div class="fb-block">
+        <div class="fb-label">Phrase Boundaries</div>
+        <div class="fb-main dim" id="phraseVal">—</div>
+        <div class="fb-sub" id="phraseSub">Markers appear on the chart</div>
+      </div>
+
       <!-- Live Feedback coaching cards -->
       <div class="coaching-section">
         <div class="coaching-header">Live Feedback</div>
@@ -742,7 +765,11 @@
 
   // ── Constants ─────────────────────────────────────────────────────
   const PITCH_WIN        = 30;     // seconds shown in live chart
-  const CHART_HOLD_MS    = 1500;   // hold last f0 through short silences
+  const CHART_HOLD_MS    = 2500;   // hold last f0 through short silences / decode gaps
+  const VOICED_HOLD_MS   = 2500;   // coaching cards + sidebar hold
+  const SIDEBAR_MS       = 250;    // min interval between sidebar DOM updates
+  const CHART_MS         = 100;    // min interval between chart redraws
+  const DEV_SMOOTH       = 0.35;   // EMA weight for new cents reading (lower = smoother)
 
   // ── Live state ────────────────────────────────────────────────────
   let pitchData    = [];
@@ -768,6 +795,13 @@
   let scriptProc = null;
   let nativeSR   = 44100;
   let _latencyMark = 0;
+  let _stickySummary = null;       // last stable readout while singing
+  let _lastSidebarUpdate = 0;
+  let _lastChartUpdate = 0;
+  let _chartDirty = false;
+  let _lastGestureSticky = 0;
+  let _lastPhraseFeedback = null;
+  let livePhraseBoundaries = [];
 
   // ── Utilities ─────────────────────────────────────────────────────
   function hzToEtDev(hz) {
@@ -819,8 +853,45 @@
   }
 
   // ── Live pitch chart ──────────────────────────────────────────────
+  const _livePhrasePlugin = {
+    id: 'livePhraseDividers',
+    afterDraw(chart) {
+      const { ctx, chartArea, scales } = chart;
+      const bounds = chart._irisBoundariesRef;
+      if (!bounds || !bounds.length) return;
+      ctx.save();
+      bounds.forEach(ev => {
+        const xPos = scales.x.getPixelForValue(ev.t);
+        if (xPos < chartArea.left - 4 || xPos > chartArea.right + 4) return;
+        if (ev.event === 'start') {
+          ctx.strokeStyle = '#7eb8f788';
+          ctx.lineWidth = 1.5;
+          ctx.setLineDash([]);
+          ctx.beginPath();
+          ctx.moveTo(xPos, chartArea.top);
+          ctx.lineTo(xPos, chartArea.bottom);
+          ctx.stroke();
+          ctx.fillStyle = '#7eb8f7cc';
+          ctx.font = `9px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif`;
+          ctx.fillText('phrase', xPos + 3, chartArea.top + 10);
+        } else if (ev.event === 'end') {
+          ctx.strokeStyle = '#55efc444';
+          ctx.lineWidth = 1;
+          ctx.setLineDash([2, 4]);
+          ctx.beginPath();
+          ctx.moveTo(xPos, chartArea.top);
+          ctx.lineTo(xPos, chartArea.bottom);
+          ctx.stroke();
+          ctx.setLineDash([]);
+        }
+      });
+      ctx.restore();
+    },
+  };
+
   const pitchChart = new Chart(document.getElementById('pitchChart'), {
     type: 'line',
+    plugins: [_livePhrasePlugin],
     data: {
       datasets: [
         {
@@ -889,6 +960,7 @@
       },
     },
   });
+  pitchChart._irisBoundariesRef = livePhraseBoundaries;
 
   // ── Timer ─────────────────────────────────────────────────────────
   setInterval(() => {
@@ -905,12 +977,13 @@
     const devEl    = document.getElementById('etDevText');
     const needle   = document.getElementById('tunerNeedle');
     const vibLegend = document.getElementById('vibSineLegend');
-    const isVib    = voiced && s.gesture === 'vibrato';
+    const isVib    = voiced && _isVibratoSignal(s);
+    const isGliss  = voiced && !isVib && _activeGesture(s) === 'glissando';
 
     noteEl.textContent = voiced ? s.et_note : '—';
     noteEl.className   = 'note-display' + (isVib ? ' vibrato-mode' : '');
-    subLbl.textContent = isVib ? 'vibrato center' : '';
-    subLbl.className   = 'note-sub-lbl' + (isVib ? ' vibrato' : '');
+    subLbl.textContent = isVib ? 'vibrato center' : isGliss ? 'sliding' : '';
+    subLbl.className   = 'note-sub-lbl' + (isVib ? ' vibrato' : isGliss ? ' glissando' : '');
     vibLegend.style.display = isVib ? '' : 'none';
 
     if (voiced) {
@@ -927,13 +1000,13 @@
     }
   }
 
-  function updateLoudnessBlock(s, voiced) {
+  function updateLoudnessBlock(s) {
     const dynEl  = document.getElementById('dynVal');
     const dbfsEl = document.getElementById('dbfsVal');
-    const silent = !voiced || s.dynamic === 'silent';
-    dynEl.textContent  = silent ? '—' : s.dynamic;
+    const audible = s.dbfs > -55;
+    dynEl.textContent  = audible && s.dynamic !== 'silent' ? s.dynamic : '—';
     dbfsEl.textContent = `${s.dbfs} dBFS`;
-    dynEl.className    = 'fb-main ' + (silent ? 'dim' : 'good');
+    dynEl.className    = 'fb-main ' + (audible && s.dynamic !== 'silent' ? 'good' : 'dim');
   }
 
   function updateBreathinessBlock(s, voiced) {
@@ -969,12 +1042,76 @@
     depthEl.className   = 'vib-param-val ' + (depthAmp >= 25 && depthAmp <= 75 ? 'good' : 'warn');
   }
 
+  function updatePhraseBlock(s, voiced) {
+    const main = document.getElementById('phraseVal');
+    const sub  = document.getElementById('phraseSub');
+    const singing = !!(voiced || s.phrase_singing);
+
+    if (s.in_phrase && s.phrase_id > 0 && singing) {
+      main.textContent = 'In phrase';
+      main.className   = 'fb-main good';
+      sub.textContent  = 'Keep singing through the line';
+    } else if (s.pending_phrase && singing) {
+      main.textContent = '—';
+      main.className   = 'fb-main dim';
+      sub.textContent  = 'Listening…';
+    } else if (s.in_phrase && s.phrase_id > 0 && !singing) {
+      main.textContent = '—';
+      main.className   = 'fb-main dim';
+      sub.textContent  = 'Listening…';
+    } else if (_lastPhraseFeedback) {
+      main.textContent = 'Between phrases';
+      main.className   = 'fb-main dim';
+      const sc = _formatPhraseScore(_lastPhraseFeedback);
+      sub.textContent  = sc ? `Last line · ${sc}` : (_lastPhraseFeedback.detail || '—');
+    } else {
+      main.textContent = '—';
+      main.className   = 'fb-main dim';
+      sub.textContent  = 'Markers appear on the chart';
+    }
+  }
+
+  function _onPhraseEvent(ev) {
+    if (!ev || !ev.event) return;
+    livePhraseBoundaries.push({ event: ev.event, phrase_id: ev.phrase_id, t: ev.t });
+    const pMin = latestT - PITCH_WIN;
+    while (livePhraseBoundaries.length && livePhraseBoundaries[0].t < pMin - 1) {
+      livePhraseBoundaries.shift();
+    }
+    _chartDirty = true;
+
+    if (ev.event === 'start') {
+      const sub = document.getElementById('phraseSub');
+      sub.textContent = `Phrase ${ev.phrase_id} started`;
+    }
+
+    if (ev.event === 'end' && ev.feedback) {
+      _lastPhraseFeedback = ev.feedback;
+      _renderCards(_lastLiveCards);
+      const sub = document.getElementById('phraseSub');
+      const sc = _formatPhraseScore(ev.feedback);
+      sub.textContent = sc
+        ? `Phrase ${ev.phrase_id} · ${sc}`
+        : (ev.feedback.detail || 'Line complete');
+    }
+  }
+
+  function _onPhraseEvents(events) {
+    if (!events || !events.length) return;
+    events.forEach(_onPhraseEvent);
+  }
+
   // ── Coaching cards ────────────────────────────────────────────────
   let _stablePitchCat  = 'in-tune';
   let _lastCardSig     = '';
   let _lastCardUpdate  = 0;
   let _lastVoicedAt    = 0;
+  let _lastGestureCat  = 'steady';
+  let _glissStickyUntil = 0;
+  let _vibStickyUntil = 0;
   const CARD_MIN_MS    = 14000; // minimum ms between card refreshes
+  const GLISS_STICKY_MS = 1800;
+  const VIB_STICKY_MS   = 4000;
 
   function _updatePitchCat(dev) {
     switch (_stablePitchCat) {
@@ -1003,24 +1140,126 @@
     return !!(s && s.et_note && s.et_note !== '—');
   }
 
+  function _displayActive(summaryVoiced) {
+    return summaryVoiced || (Date.now() - lastChartVoicedAt < VOICED_HOLD_MS);
+  }
+
+  function _updateStickySummary(s) {
+    if (_stickySummary) {
+      _stickySummary.phrase_id = s.phrase_id;
+      _stickySummary.in_phrase = s.in_phrase;
+      _stickySummary.pending_phrase = s.pending_phrase;
+      _stickySummary.phrase_singing = s.phrase_singing;
+      if (s.phrase_feedback) _stickySummary.phrase_feedback = s.phrase_feedback;
+    }
+    if (!_summaryVoiced(s)) return;
+    if (!_stickySummary) {
+      _stickySummary = { ...s };
+      return;
+    }
+    _stickySummary.et_note = s.et_note;
+    _stickySummary.et_dev_cents =
+      _stickySummary.et_dev_cents * (1 - DEV_SMOOTH) + s.et_dev_cents * DEV_SMOOTH;
+    const now = Date.now();
+    const motion = s.gesture === 'glissando' || s.gesture === 'transition'
+      || s.gesture === 'vibrato'
+      || s.gesture_raw === 'glissando' || s.gesture_raw === 'transition'
+      || s.gesture_raw === 'vibrato'
+      || s.glissando_active || s.vibrato_active;
+    if (s.gesture === _stickySummary.gesture || now - _lastGestureSticky > 400 || motion) {
+      _stickySummary.gesture = s.gesture;
+      _lastGestureSticky = now;
+    }
+    _stickySummary.gesture_raw = s.gesture_raw;
+    _stickySummary.glissando_active = s.glissando_active;
+    _stickySummary.vibrato_active = s.vibrato_active;
+    _stickySummary.has_vibrato = s.has_vibrato;
+    if (s.vib_rate_hz != null)  _stickySummary.vib_rate_hz = s.vib_rate_hz;
+    if (s.vib_depth_cents != null) _stickySummary.vib_depth_cents = s.vib_depth_cents;
+    _stickySummary.cpp = s.cpp;
+    _stickySummary.dynamic = s.dynamic;
+    _stickySummary.dbfs = s.dbfs;
+  }
+
+  function _sidebarSummary(s, displayActive) {
+    if (displayActive && _stickySummary) return _stickySummary;
+    return s;
+  }
+
+  function _sidebarVoiced(s, displayActive) {
+    return displayActive && !!(_stickySummary?.et_note && _stickySummary.et_note !== '—');
+  }
+
+  function _flushChart() {
+    if (!_chartDirty) return;
+    pitchChart.update('none');
+    _chartDirty = false;
+    _lastChartUpdate = Date.now();
+  }
+
+  function _isVibratoSignal(s) {
+    return !!(s.vibrato_active || s.has_vibrato
+      || s.gesture === 'vibrato' || s.gesture_raw === 'vibrato'
+      || (s.vib_rate_hz != null && s.vib_depth_cents != null && s.vib_depth_cents >= 25));
+  }
+
+  function _activeGesture(s) {
+    const now = Date.now();
+    const g = s.gesture || 'steady';
+    const r = s.gesture_raw || g;
+    const glissNow = s.glissando_active || g === 'glissando' || r === 'glissando';
+    if (glissNow) {
+      _vibStickyUntil = 0;
+      _glissStickyUntil = now + GLISS_STICKY_MS;
+      return 'glissando';
+    }
+    if (now < _glissStickyUntil && !_isVibratoSignal(s)) return 'glissando';
+
+    if (_isVibratoSignal(s)) {
+      _vibStickyUntil = now + VIB_STICKY_MS;
+      return 'vibrato';
+    }
+    if (now < _vibStickyUntil) return 'vibrato';
+
+    if (g === 'transition' || r === 'transition') return 'transition';
+    if (g === 'vibrato' || r === 'vibrato') return 'vibrato';
+    return g;
+  }
+
   function _buildCards(s) {
     const cards = [];
+    const gesture = _activeGesture(s);
     _updatePitchCat(s.et_dev_cents);
 
-    // Pitch card
-    const p = _stablePitchCat;
-    if      (p === 'in-tune')    cards.push({ type: 'good', title: 'Great pitch control!',    sub: 'You\'re staying centered.' });
-    else if (p === 'flat-bad')   cards.push({ type: 'warn', title: 'Pitch drifting flat',      sub: 'Try supporting more during sustained notes.' });
-    else if (p === 'flat-mild')  cards.push({ type: 'warn', title: 'Slightly flat',            sub: 'Push your pitch up a little.' });
-    else if (p === 'sharp-bad')  cards.push({ type: 'warn', title: 'Pitch drifting sharp',     sub: 'Ease back down gently.' });
-    else                         cards.push({ type: 'warn', title: 'Slightly sharp',            sub: 'Ease back a little.' });
+    // Gesture — glissando (pitch scoring paused)
+    if (gesture === 'glissando') {
+      cards.push({
+        type:  'tip',
+        title: 'Sliding between notes',
+        sub:   'Pitch accuracy pauses during a slide — land steady on the next note.',
+      });
+    }
 
-    // Vibrato card (only when rate data is available)
-    if (s.vib_rate_hz != null) {
-      const r = s.vib_rate_hz;
-      if (r >= 5.0 && r <= 7.0) cards.push({ type: 'good', title: 'Vibrato looks good',    sub: `${r.toFixed(1)} Hz — nice rate.` });
-      else if (r < 5.0)          cards.push({ type: 'warn', title: 'Vibrato a bit slow',    sub: `${r.toFixed(1)} Hz — aim for 5–7 Hz.` });
-      else                        cards.push({ type: 'warn', title: 'Vibrato a bit fast',    sub: `${r.toFixed(1)} Hz — try slowing down.` });
+    // Pitch card (steady / in-tune feedback only when not glissando)
+    if (gesture !== 'glissando' && gesture !== 'transition') {
+      const p = _stablePitchCat;
+      if      (p === 'in-tune')    cards.push({ type: 'good', title: 'Great pitch control!',    sub: 'You\'re staying centered.' });
+      else if (p === 'flat-bad')   cards.push({ type: 'warn', title: 'Pitch drifting flat',      sub: 'Try supporting more during sustained notes.' });
+      else if (p === 'flat-mild')  cards.push({ type: 'warn', title: 'Slightly flat',            sub: 'Push your pitch up a little.' });
+      else if (p === 'sharp-bad')  cards.push({ type: 'warn', title: 'Pitch drifting sharp',     sub: 'Ease back down gently.' });
+      else                         cards.push({ type: 'warn', title: 'Slightly sharp',            sub: 'Ease back a little.' });
+    }
+
+    // Vibrato card — when oscillation is detected (not blocked by false glissando)
+    if (_isVibratoSignal(s)) {
+      if (s.vib_rate_hz != null) {
+        const r = s.vib_rate_hz;
+        if (r >= 5.0 && r <= 7.0) cards.push({ type: 'good', title: 'Vibrato looks good',    sub: `${r.toFixed(1)} Hz — nice rate.` });
+        else if (r < 5.0)          cards.push({ type: 'warn', title: 'Vibrato a bit slow',    sub: `${r.toFixed(1)} Hz — aim for 5–7 Hz.` });
+        else                        cards.push({ type: 'warn', title: 'Vibrato a bit fast',    sub: `${r.toFixed(1)} Hz — try slowing down.` });
+      } else {
+        cards.push({ type: 'good', title: 'Vibrato detected', sub: 'Keep the oscillation relaxed and even.' });
+      }
     }
 
     // Breathiness card
@@ -1031,15 +1270,52 @@
     return cards.slice(0, 4);
   }
 
+  let _lastLiveCards = [];
+
+  function _formatPhraseScore(fb) {
+    if (fb == null || fb.phrase_score == null) return null;
+    const label = fb.score_label || '';
+    return label ? `${label} · ${fb.phrase_score}` : String(fb.phrase_score);
+  }
+
+  function _createPhraseReviewCard(fb) {
+    const icon = fb.rating === 'good' ? '✓' : '↻';
+    const score = fb.phrase_score;
+    const title = fb.headline || 'Phrase complete';
+    const scoreBadge = score != null
+      ? `<span class="phrase-score-badge">${score}</span>` : '';
+    const breakdown = fb.score_breakdown
+      ? `<div class="phrase-score-breakdown">${fb.score_breakdown}</div>` : '';
+    const tip = fb.detail || (fb.bullets && fb.bullets[0]) || '';
+    const el = document.createElement('div');
+    el.className = `coaching-card phrase-review ${fb.rating === 'good' ? 'good' : 'warn'}`;
+    el.innerHTML = `<div class="card-icon">${icon}</div>
+      <div class="card-content">
+        <div class="card-title">${scoreBadge}<span>${title}</span></div>
+        ${breakdown}
+        <div class="card-sub">${tip}</div>
+      </div>`;
+    return el;
+  }
+
   function _renderCards(cards) {
+    _lastLiveCards = cards || [];
     const list = document.getElementById('coachingList');
     list.innerHTML = '';
-    if (!cards || cards.length === 0) {
-      list.innerHTML = '<div class="coaching-idle">Sing something to see feedback.</div>';
+
+    if (_lastPhraseFeedback) {
+      list.appendChild(_createPhraseReviewCard(_lastPhraseFeedback));
+    }
+
+    if (!_lastLiveCards.length) {
+      if (!_lastPhraseFeedback) {
+        list.innerHTML = '<div class="coaching-idle">Sing something to see feedback.</div>';
+      }
       return;
     }
-    cards.forEach(c => {
-      const icon = c.type === 'good' ? '✓' : '⚠';
+
+    _lastLiveCards.forEach(c => {
+      const icon = c.type === 'good' ? '✓' : c.type === 'tip' ? '→' : '⚠';
       const el   = document.createElement('div');
       el.className = `coaching-card ${c.type}`;
       el.innerHTML = `<div class="card-icon">${icon}</div>
@@ -1049,33 +1325,46 @@
         </div>`;
       list.appendChild(el);
     });
+
+    // Cap total cards (phrase review always kept at top)
+    while (list.children.length > 5) {
+      list.removeChild(list.lastChild);
+    }
   }
 
-  function updateCoaching(s) {
+  function updateCoaching(s, displayActive) {
     const now    = Date.now();
     const voiced = _summaryVoiced(s);
     if (voiced) _lastVoicedAt = now;
+    const show = _sidebarSummary(s, displayActive);
 
-    const silent = !voiced && (now - _lastVoicedAt) > 1500;
+    const silent = !displayActive && (now - _lastVoicedAt) > VOICED_HOLD_MS;
     if (silent) {
-      if (_lastCardSig !== 'silent') { _lastCardSig = 'silent'; _renderCards([]); }
+      if (_lastCardSig !== 'silent') {
+        _lastCardSig = 'silent';
+        _renderCards([]);
+      }
       return;
     }
-    if (!voiced) return; // brief gap — hold current cards
+    if (!displayActive) return;
 
     // Compute categorical signature to detect meaningful changes
-    _updatePitchCat(s.et_dev_cents);
-    const vibCat = s.vib_rate_hz == null ? 'none'
-      : s.vib_rate_hz < 5.0 ? 'slow' : s.vib_rate_hz > 7.0 ? 'fast' : 'ok';
-    const breathCat = s.cpp > 10 ? 'clear' : s.cpp > 5 ? 'some' : s.cpp > 1.5 ? 'breathy' : 'none';
-    const sig = `${_stablePitchCat}|${vibCat}|${breathCat}`;
+    _updatePitchCat(show.et_dev_cents);
+    const vibCat = show.vib_rate_hz == null ? 'none'
+      : show.vib_rate_hz < 5.0 ? 'slow' : show.vib_rate_hz > 7.0 ? 'fast' : 'ok';
+    const breathCat = show.cpp > 10 ? 'clear' : show.cpp > 5 ? 'some' : show.cpp > 1.5 ? 'breathy' : 'none';
+    const gestureCat = _activeGesture(show);
+    const sig = `${_stablePitchCat}|${vibCat}|${breathCat}|${gestureCat}`;
 
     const timedOut = (now - _lastCardUpdate) >= CARD_MIN_MS;
-    if (sig === _lastCardSig && !timedOut) return;
+    const gestureChanged = gestureCat !== _lastGestureCat;
+    if (sig === _lastCardSig && !timedOut && !gestureChanged) return;
+
+    _lastGestureCat = gestureCat;
 
     _lastCardSig    = sig;
     _lastCardUpdate = now;
-    _renderCards(_buildCards(s));
+    _renderCards(_buildCards(show));
   }
 
   // ── WebSocket ─────────────────────────────────────────────────────
@@ -1095,9 +1384,22 @@
 
       const msg = JSON.parse(evt.data);
       const s   = msg.summary;
+      if (msg.phrase_events && msg.phrase_events.length) {
+        _onPhraseEvents(msg.phrase_events);
+      } else if (msg.phrase_event) {
+        _onPhraseEvent(msg.phrase_event);
+      }
+      if (s.phrase_feedback && s.phrase_boundary === 'end') {
+        _lastPhraseFeedback = s.phrase_feedback;
+        _renderCards(_lastLiveCards);
+      }
       const summaryVoiced = _summaryVoiced(s);
       if (summaryVoiced) lastChartVoicedAt = Date.now();
-      const chartActive = summaryVoiced || (Date.now() - lastChartVoicedAt < CHART_HOLD_MS);
+      _updateStickySummary(s);
+      const displayActive = _displayActive(summaryVoiced);
+      const chartActive = displayActive;
+      const sidebar = _sidebarSummary(s, displayActive);
+      const sidebarVoiced = _sidebarVoiced(s, displayActive);
 
       // Accumulate for analysis
       msg.frames.forEach(f => {
@@ -1165,17 +1467,26 @@
       while (vibratoSineData.length  && vibratoSineData[0].x  < pMin) vibratoSineData.shift();
       pitchChart.options.scales.x.min = Math.max(0, latestT - PITCH_WIN);
       pitchChart.options.scales.x.max = Math.max(latestT, PITCH_WIN);
-      pitchChart.update('none');
+      _chartDirty = true;
+      const now = Date.now();
+      if (now - _lastChartUpdate >= CHART_MS) _flushChart();
 
-      // Update sidebar blocks
-      updatePitchBlock(s, summaryVoiced);
-      updateLoudnessBlock(s, summaryVoiced);
-      updateBreathinessBlock(s, summaryVoiced);
-      updateVibratoBlock(s, summaryVoiced);
-      updateCoaching(s);
+      // Sidebar: throttle DOM writes so readouts stay readable while singing
+      if (now - _lastSidebarUpdate >= SIDEBAR_MS) {
+        updatePitchBlock(sidebar, sidebarVoiced);
+        updateLoudnessBlock(sidebar);
+        updateBreathinessBlock(sidebar, sidebarVoiced);
+        updateVibratoBlock(sidebar, sidebarVoiced);
+        updatePhraseBlock(s, sidebarVoiced);
+        updateCoaching(s, displayActive);
+        _lastSidebarUpdate = now;
+      }
     };
 
-    setInterval(() => { if (ws && ws.readyState === WebSocket.OPEN) ws.send('ping'); }, 8000);
+    setInterval(() => {
+      if (ws && ws.readyState === WebSocket.OPEN) ws.send('ping');
+    }, 8000);
+    setInterval(_flushChart, CHART_MS);
   }
 
   // ── End Session ───────────────────────────────────────────────────
@@ -1296,12 +1607,10 @@
           ctx.lineTo(xPos, chartArea.bottom);
           ctx.stroke();
           ctx.setLineDash([]);
+          ctx.fillStyle = '#7eb8f7cc';
+          ctx.font = `9px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif`;
+          ctx.fillText('phrase', xPos + 4, chartArea.top + 10);
         }
-        ctx.fillStyle = '#7eb8f7cc';
-        ctx.font = `9px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif`;
-        const label = `P${ph.idx}`;
-        const lx = i === 0 ? chartArea.left + 4 : xPos + 4;
-        ctx.fillText(label, lx, chartArea.top + 10);
       });
       ctx.restore();
     },
@@ -1712,7 +2021,13 @@
     allAudioPCM.length  = 0;
     latestT = 0; startTs = null; startDate = null;
     lastVoicedF0 = null; lastVoicedCentral = null; lastChartVoicedAt = 0;
+    _stickySummary = null; _lastSidebarUpdate = 0; _lastChartUpdate = 0; _chartDirty = false;
+    _lastGestureSticky = 0; _lastPhraseFeedback = null; _lastLiveCards = [];
+    livePhraseBoundaries.length = 0;
     _stablePitchCat = 'in-tune'; _lastCardSig = ''; _lastCardUpdate = 0; _lastVoicedAt = 0;
+    _lastGestureCat = 'steady';
+    _glissStickyUntil = 0;
+    _vibStickyUntil = 0;
 
     document.getElementById('timer').textContent     = '00:00';
     document.getElementById('latencyVal').textContent = '—';

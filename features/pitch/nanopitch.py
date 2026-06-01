@@ -143,6 +143,41 @@ class NanoPitchExtractor:
         print(f"Loaded {kind} weights from {local_path}")
         return cls(model, device)
 
+    _PLUS_HEAD_PREFIXES = ("dense_gesture.", "dense_register.", "dense_dynamics.")
+
+    @classmethod
+    def from_hybrid_checkpoints(
+        cls,
+        pitch_path: str,
+        plus_path: str,
+        device: str = "cpu",
+    ) -> "NanoPitchExtractor":
+        """NanoPitchPlus with pitch/VAD backbone from pitch_path, extra heads from plus_path."""
+        pitch_ckpt = torch.load(pitch_path, map_location=device, weights_only=False)
+        plus_ckpt = torch.load(plus_path, map_location=device, weights_only=False)
+
+        pitch_sd = pitch_ckpt.get("state_dict", pitch_ckpt) if isinstance(pitch_ckpt, dict) else pitch_ckpt
+        plus_sd = plus_ckpt.get("state_dict", plus_ckpt) if isinstance(plus_ckpt, dict) else plus_ckpt
+        kwargs = {}
+        if isinstance(plus_ckpt, dict):
+            kwargs.update(plus_ckpt.get("model_kwargs") or {})
+        if isinstance(pitch_ckpt, dict):
+            kwargs.update(pitch_ckpt.get("model_kwargs") or {})
+
+        model = NanoPitchPlus(
+            cond_size=kwargs.get("cond_size", 64),
+            gru_size=kwargs.get("gru_size", 96),
+        )
+        model.load_state_dict(pitch_sd, strict=False)
+        head_sd = {
+            k: v for k, v in plus_sd.items()
+            if k.startswith(cls._PLUS_HEAD_PREFIXES)
+        }
+        model.load_state_dict(head_sd, strict=False)
+        print(f"Loaded hybrid NanoPitchPlus — pitch from {pitch_path}")
+        print(f"  gesture/register/dynamics heads from {plus_path}")
+        return cls(model, device)
+
     @classmethod
     def from_pretrained(
         cls,
@@ -211,7 +246,8 @@ class NanoPitchExtractor:
         mel_tensor = torch.from_numpy(mel).unsqueeze(0).to(self.device)  # (1, T, 40)
 
         with torch.no_grad():
-            vad_out, pitch_out, _ = self.model(mel_tensor)
+            out = self.model(mel_tensor)
+            vad_out, pitch_out = out[0], out[1]
 
         vad = vad_out[0, :, 0].cpu().numpy()          # (T,)
         posteriorgram = pitch_out[0].cpu().numpy()     # (T, 360)

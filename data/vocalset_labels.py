@@ -17,6 +17,8 @@ from typing import Iterable
 
 import numpy as np
 
+from features.pitch.gesture import label_gestures_from_f0
+
 # ── Gesture ────────────────────────────────────────────────────────────
 GESTURE_VOCAB = ["steady", "vibrato", "glissando", "transition"]
 GESTURE_STEADY = 0
@@ -113,90 +115,15 @@ def _is_true(val) -> bool:
     return s in {"true", "1", "yes", "t"}
 
 
-def detect_vibrato_frames(f0: np.ndarray, min_voiced: int = 30) -> np.ndarray:
-    """Mark frames with 4.5–8 Hz f0 modulation (same band as live vibrato analysis)."""
-    from scipy.signal import butter, filtfilt
-
-    mask = np.zeros(len(f0), dtype=bool)
-    voiced = f0 > 0
-    if voiced.sum() < min_voiced:
-        return mask
-
-    log_f0 = np.zeros_like(f0, dtype=np.float64)
-    log_f0[voiced] = np.log2(f0[voiced])
-    log_f0[~voiced] = np.interp(
-        np.flatnonzero(~voiced),
-        np.flatnonzero(voiced),
-        log_f0[voiced],
-    )
-
-    sr_frame = 100.0  # 10 ms hop
-    b, a = butter(2, [4.5 / (sr_frame / 2), 8.0 / (sr_frame / 2)], btype="band")
-    try:
-        mod = filtfilt(b, a, log_f0)
-    except ValueError:
-        return mask
-
-    # Normalise modulation energy per clip.
-    energy = np.abs(mod)
-    thr = np.percentile(energy[voiced], 75) if voiced.any() else 0.0
-    if thr <= 0:
-        return mask
-    mask = (energy > thr) & voiced
-    return mask
-
-
-def detect_glissando_frames(
-    f0: np.ndarray,
-    transition_mask: np.ndarray,
-    min_slope_cents: float = 8.0,
-) -> np.ndarray:
-    """Mark transition frames with sustained monotonic f0 motion."""
-    mask = np.zeros(len(f0), dtype=bool)
-    if len(f0) < 3:
-        return mask
-
-    log_f0 = np.zeros_like(f0, dtype=np.float64)
-    voiced = f0 > 0
-    log_f0[voiced] = np.log2(f0[voiced] + 1e-10)
-    slope = np.diff(log_f0, prepend=log_f0[0]) * 1200.0  # cents / frame
-
-    for t in range(1, len(f0) - 1):
-        if not transition_mask[t] or not voiced[t]:
-            continue
-        seg = slope[max(0, t - 2): min(len(f0), t + 3)]
-        if seg.size < 2:
-            continue
-        same_sign = np.all(seg > 0) or np.all(seg < 0)
-        if same_sign and np.mean(np.abs(seg)) >= min_slope_cents:
-            mask[t] = True
-    return mask
-
-
 def label_gestures(
     f0: np.ndarray,
     transition_col: Iterable,
     technique: str | None = None,
 ) -> np.ndarray:
     """Build per-frame gesture labels from Annotated-VocalSet columns."""
-    transition_col = list(transition_col)
     n = len(f0)
-    labels = np.full(n, GESTURE_STEADY, dtype=np.int8)
-
-    transition_mask = np.array([_is_true(v) for v in transition_col[:n]], dtype=bool)
-    labels[transition_mask] = GESTURE_TRANSITION
-
-    vibrato_mask = detect_vibrato_frames(f0)
-    if technique and _norm_technique(technique) in VIBRATO_TECHNIQUES:
-        voiced = f0 > 0
-        vibrato_mask |= voiced & ~transition_mask
-
-    gliss_mask = detect_glissando_frames(f0, transition_mask)
-
-    # Priority: transition > glissando > vibrato > steady
-    labels[gliss_mask & ~transition_mask] = GESTURE_GLISSANDO
-    labels[vibrato_mask & ~transition_mask & ~gliss_mask] = GESTURE_VIBRATO
-    return labels
+    csv_transition = np.array([_is_true(v) for v in list(transition_col)[:n]], dtype=bool)
+    return label_gestures_from_f0(f0, csv_transition)
 
 
 def detect_breath_frames(
