@@ -675,7 +675,7 @@
         </div>
         <div class="bar-row">
           <div class="bar-row-top">
-            <span class="bar-name">Dynamics Control</span>
+            <span class="bar-name">Level variation (session)</span>
             <span class="bar-val" id="barDynVal" style="color:var(--yellow);">—</span>
           </div>
           <div class="bar-track">
@@ -708,7 +708,7 @@
             <button class="tab active" data-tab="pitch">Pitch</button>
             <button class="tab" data-tab="vibrato">Vibrato</button>
             <button class="tab" data-tab="breathiness">Breathiness</button>
-            <button class="tab" data-tab="dynamics">Dynamics</button>
+            <button class="tab" data-tab="dynamics">Loudness</button>
           </div>
         </div>
         <div class="trend-chart-wrap">
@@ -786,7 +786,9 @@
   // Accumulated for /analyze POST and phrase replay
   let allFrames    = [];
   let allSummaries = [];
+  const SR16 = 16000;
   let allAudioPCM  = [];   // 16 kHz Float32Array chunks for phrase replay
+  let sessionAudioSamples = 0;  // samples sent (must match server audio clock)
 
   // Audio / WS handles
   let ws         = null;
@@ -802,6 +804,8 @@
   let _lastGestureSticky = 0;
   let _lastPhraseFeedback = null;
   let livePhraseBoundaries = [];
+  let allPhraseEvents = [];
+  let phraseReplayById = {};  // phrase_id → { startSample, endSample, startT, endT }
 
   // ── Utilities ─────────────────────────────────────────────────────
   function hzToEtDev(hz) {
@@ -839,7 +843,7 @@
   }
 
   // ── Segment color for color-coded pitch line ───────────────────────
-  // Green ≤10¢, yellow ≤25¢, red >25¢; dim for transition/glissando
+  // Green ≤14¢, yellow ≤30¢, red >30¢
   function segmentColor(ctx) {
     const raw = ctx.p1.raw;
     if (!raw || !raw.voiced) return 'transparent';
@@ -847,8 +851,8 @@
     const dev = raw.etDev;
     if (dev === null || dev === undefined) return '#7eb8f7';
     const abs = Math.abs(dev);
-    if (abs <= 10) return '#55efc4';
-    if (abs <= 25) return '#fdcb6e';
+    if (abs <= 14) return '#55efc4';
+    if (abs <= 30) return '#fdcb6e';
     return '#e17055';
   }
 
@@ -992,7 +996,7 @@
       needle.style.left  = `${pct}%`;
       const sign = dev > 0 ? '+' : '';
       devEl.textContent = `${sign}${dev.toFixed(1)} ¢`;
-      devEl.className   = 'et-dev ' + (Math.abs(dev) <= 10 ? 'good' : Math.abs(dev) <= 25 ? 'warn' : 'bad');
+      devEl.className   = 'et-dev ' + (Math.abs(dev) <= 14 ? 'good' : Math.abs(dev) <= 30 ? 'warn' : 'bad');
     } else {
       needle.style.left = '50%';
       devEl.textContent = '—';
@@ -1028,7 +1032,9 @@
   function updateVibratoBlock(s, voiced) {
     const rateEl  = document.getElementById('vibRateVal');
     const depthEl = document.getElementById('vibDepthVal');
-    if (!voiced || s.vib_rate_hz == null) {
+    const showVib = voiced && (s.has_vibrato || s.vibrato_active)
+      && s.vib_rate_hz != null;
+    if (!showVib) {
       rateEl.textContent  = '—'; rateEl.className  = 'vib-param-val dim';
       depthEl.textContent = '—'; depthEl.className = 'vib-param-val dim';
       return;
@@ -1071,8 +1077,49 @@
     }
   }
 
+  function _rebuildPhraseReplayMap() {
+    phraseReplayById = {};
+    for (const ev of allPhraseEvents) {
+      const pid = ev.phrase_id;
+      if (!pid) continue;
+      if (!phraseReplayById[pid]) phraseReplayById[pid] = {};
+      const slot = phraseReplayById[pid];
+      if (ev.event === 'start') {
+        slot.startSample = ev.vocal_start_samples ?? ev.samples;
+        slot.endSample   = null;
+        slot.startT = ev.vocal_start_t ?? ev.t;
+        slot.endT   = null;
+      } else if (ev.event === 'end') {
+        slot.endSample = ev.vocal_end_samples ?? ev.samples;
+        slot.endT = ev.vocal_end_t ?? ev.t;
+        if (slot.startT == null) slot.startT = ev.t;
+      }
+    }
+  }
+
+  function _scaledSample(sample, flatLen) {
+    const lastT = allFrames.length ? allFrames[allFrames.length - 1].t : 0;
+    const expected = Math.round(lastT * SR16);
+    if (expected > SR16 && flatLen > 0) {
+      return Math.round(sample * (flatLen / expected));
+    }
+    return sample;
+  }
+
   function _onPhraseEvent(ev) {
     if (!ev || !ev.event) return;
+    allPhraseEvents.push({
+      event: ev.event,
+      phrase_id: ev.phrase_id,
+      t: ev.t,
+      samples: ev.samples != null ? ev.samples : Math.round((ev.t || 0) * SR16),
+      vocal_start_t: ev.vocal_start_t,
+      vocal_start_samples: ev.vocal_start_samples,
+      vocal_end_t: ev.vocal_end_t,
+      vocal_end_samples: ev.vocal_end_samples,
+      feedback: ev.event === 'end' ? ev.feedback : null,
+    });
+    _rebuildPhraseReplayMap();
     livePhraseBoundaries.push({ event: ev.event, phrase_id: ev.phrase_id, t: ev.t });
     const pMin = latestT - PITCH_WIN;
     while (livePhraseBoundaries.length && livePhraseBoundaries[0].t < pMin - 1) {
@@ -1111,33 +1158,37 @@
   let _vibStickyUntil = 0;
   const CARD_MIN_MS    = 14000; // minimum ms between card refreshes
   const GLISS_STICKY_MS = 1800;
-  const VIB_STICKY_MS   = 4000;
+  const VIB_STICKY_MS   = 1200;
 
   function _updatePitchCat(dev) {
     switch (_stablePitchCat) {
       case 'in-tune':
-        if (dev < -25)      _stablePitchCat = dev < -35 ? 'flat-bad' : 'flat-mild';
-        else if (dev > 25)  _stablePitchCat = dev > 35  ? 'sharp-bad' : 'sharp-mild';
+        if (dev < -26)      _stablePitchCat = dev < -36 ? 'flat-bad' : 'flat-mild';
+        else if (dev > 26)  _stablePitchCat = dev > 36  ? 'sharp-bad' : 'sharp-mild';
         break;
       case 'flat-mild':
-        if (dev > -12)       _stablePitchCat = 'in-tune';
-        else if (dev < -35)  _stablePitchCat = 'flat-bad';
+        if (dev > -16)       _stablePitchCat = 'in-tune';
+        else if (dev < -36)  _stablePitchCat = 'flat-bad';
         break;
       case 'sharp-mild':
-        if (dev < 12)        _stablePitchCat = 'in-tune';
-        else if (dev > 35)   _stablePitchCat = 'sharp-bad';
+        if (dev < 16)        _stablePitchCat = 'in-tune';
+        else if (dev > 36)   _stablePitchCat = 'sharp-bad';
         break;
       case 'flat-bad':
-        if (dev > -28)       _stablePitchCat = dev > -12 ? 'in-tune' : 'flat-mild';
+        if (dev > -30)       _stablePitchCat = dev > -16 ? 'in-tune' : 'flat-mild';
         break;
       case 'sharp-bad':
-        if (dev < 28)        _stablePitchCat = dev < 12  ? 'in-tune' : 'sharp-mild';
+        if (dev < 30)        _stablePitchCat = dev < 16  ? 'in-tune' : 'sharp-mild';
         break;
     }
   }
 
   function _summaryVoiced(s) {
-    return !!(s && s.et_note && s.et_note !== '—');
+    // Require both a valid pitch AND audible energy so we don't treat
+    // "held pitch" through silence as real singing.
+    const hasNote = !!(s && s.et_note && s.et_note !== '—');
+    const audible = !!(s && typeof s.dbfs === 'number' && s.dbfs > -55);
+    return hasNote && audible;
   }
 
   function _displayActive(summaryVoiced) {
@@ -1198,9 +1249,12 @@
   }
 
   function _isVibratoSignal(s) {
-    return !!(s.vibrato_active || s.has_vibrato
-      || s.gesture === 'vibrato' || s.gesture_raw === 'vibrato'
-      || (s.vib_rate_hz != null && s.vib_depth_cents != null && s.vib_depth_cents >= 25));
+    if (!s) return false;
+    if (s.vibrato_active) return true;
+    const labeledVib = s.gesture === 'vibrato' || s.gesture_raw === 'vibrato';
+    if (labeledVib && (s.has_vibrato || (s.vib_rate_hz != null && s.vib_depth_cents >= 12)))
+      return true;
+    return !!(s.has_vibrato && s.vib_rate_hz != null);
   }
 
   function _activeGesture(s) {
@@ -1284,15 +1338,12 @@
     const title = fb.headline || 'Phrase complete';
     const scoreBadge = score != null
       ? `<span class="phrase-score-badge">${score}</span>` : '';
-    const breakdown = fb.score_breakdown
-      ? `<div class="phrase-score-breakdown">${fb.score_breakdown}</div>` : '';
     const tip = fb.detail || (fb.bullets && fb.bullets[0]) || '';
     const el = document.createElement('div');
     el.className = `coaching-card phrase-review ${fb.rating === 'good' ? 'good' : 'warn'}`;
     el.innerHTML = `<div class="card-icon">${icon}</div>
       <div class="card-content">
         <div class="card-title">${scoreBadge}<span>${title}</span></div>
-        ${breakdown}
         <div class="card-sub">${tip}</div>
       </div>`;
     return el;
@@ -1416,7 +1467,15 @@
         });
       });
       const lastT = msg.frames[msg.frames.length - 1]?.t ?? 0;
-      allSummaries.push({ t: lastT, cpp: s.cpp, dbfs: s.dbfs });
+      allSummaries.push({
+        t: lastT,
+        cpp: s.cpp,
+        dbfs: s.dbfs,
+        has_vibrato: !!s.has_vibrato,
+        vib_rate_hz: s.vib_rate_hz,
+        vib_depth_cents: s.vib_depth_cents,
+        vib_consistency: s.vib_consistency,
+      });
 
       // Update live chart data
       msg.frames.forEach(f => {
@@ -1446,6 +1505,7 @@
         // Vibrato sine wave: synthesise using current summary rate + depth.
         // Phase advances 2π·rate·10ms each frame; resets when leaving vibrato.
         if (isVoiced && f.gesture === 'vibrato' && f.central && f.central > 0
+            && (s.has_vibrato || s.vibrato_active)
             && s.vib_rate_hz != null && s.vib_depth_cents != null) {
           vibratoPhase += 2 * Math.PI * s.vib_rate_hz * 0.01;
           const ampCents = s.vib_depth_cents / 2;
@@ -1506,7 +1566,7 @@
       const resp = await fetch('/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ frames: allFrames, summaries: allSummaries }),
+        body: JSON.stringify({ frames: allFrames, summaries: allSummaries, phrase_events: allPhraseEvents }),
       });
       result = await resp.json();
     } catch (err) {
@@ -1573,9 +1633,17 @@
       document.getElementById(`bar${id}Fill`).style.width = `${val}%`;
     }
     setBar('Pitch',  sc.pitch_accuracy);
-    setBar('Vib',    sc.vibrato_stability);
+    if (sc.vibrato_stability != null && sc.vibrato_stability !== undefined) {
+      setBar('Vib', sc.vibrato_stability);
+    } else {
+      document.getElementById('barVibVal').textContent  = 'N/A';
+      document.getElementById('barVibFill').style.width = '0%';
+    }
     setBar('Breath', sc.breath_support);
-    setBar('Dyn',    sc.dynamics_control);
+    const varDb = sc.level_variation_db ?? 0;
+    document.getElementById('barDynVal').textContent = `${varDb.toFixed(1)} dB`;
+    document.getElementById('barDynFill').style.width =
+      `${Math.min(100, Math.max(8, varDb * 5))}%`;
 
     // -- Mini pitch chart --
     renderMiniChart(data);
@@ -1716,7 +1784,6 @@
   }
 
   // ── Phrase Detail Modal ────────────────────────────────────────────
-  const SR16 = 16000;
   let _modalCharts    = {};
   let _modalSrc       = null;
   let _modalPlayStart = 0;   // audioCtx.currentTime at play start
@@ -1793,18 +1860,36 @@
     _modalRAF = requestAnimationFrame(tick);
   }
 
-  function openPhraseModal(ph) {
-    const startT = ph.start_t, endT = ph.end_t;
-
-    // ── Extract PCM slice for this phrase ────────────────────────────
-    const startSmp = Math.floor(startT * SR16);
-    const endSmp   = Math.ceil(endT   * SR16);
-    const totalSmp = allAudioPCM.reduce((s, c) => s + c.length, 0);
-    const flat     = new Float32Array(totalSmp);
+  function _flattenSessionPCM() {
+    const totalSmp = sessionAudioSamples || allAudioPCM.reduce((s, c) => s + c.length, 0);
+    const flat = new Float32Array(totalSmp);
     let pos = 0;
     for (const c of allAudioPCM) { flat.set(c, pos); pos += c.length; }
-    _modalPCM      = flat.slice(Math.min(startSmp, flat.length),
-                                 Math.min(endSmp,   flat.length));
+    return flat;
+  }
+
+  function openPhraseModal(ph) {
+    _rebuildPhraseReplayMap();
+    const live = phraseReplayById[ph.idx] || {};
+    const startT = live.startT ?? ph.start_t;
+    const endT   = live.endT   ?? ph.end_t;
+
+    // ── Extract PCM slice for this phrase ────────────────────────────
+    // Prefer live vocal onset/offset samples; align to client PCM clock.
+    const flat = _flattenSessionPCM();
+    const PAD  = Math.round(0.08 * SR16);  // 80 ms pad
+    let startSmp = live.startSample ?? ph.start_sample;
+    let endSmp   = live.endSample   ?? ph.end_sample;
+    if (startSmp == null) startSmp = Math.floor(startT * SR16);
+    if (endSmp == null)   endSmp   = Math.ceil(endT * SR16);
+    startSmp = _scaledSample(startSmp, flat.length);
+    endSmp   = _scaledSample(endSmp, flat.length);
+    startSmp = Math.max(0, startSmp - PAD);
+    endSmp   = Math.min(flat.length, endSmp + PAD);
+    if (endSmp <= startSmp) {
+      endSmp = Math.min(flat.length, startSmp + Math.round((endT - startT) * SR16) + PAD);
+    }
+    _modalPCM      = flat.slice(startSmp, Math.max(startSmp, endSmp));
     _modalDuration = _modalPCM.length / SR16;
     _modalOffset   = 0;
     _stopModalAudio();
@@ -1958,14 +2043,23 @@
     pitch:       { scores: d => d.trend.pitch_scores,    color: '#7eb8f7', label: 'Pitch Accuracy' },
     vibrato:     { scores: d => d.trend.vib_scores,      color: '#a29bfe', label: 'Vibrato Stability' },
     breathiness: { scores: d => d.trend.breath_scores,   color: '#55efc4', label: 'Breath Support' },
-    dynamics:    { scores: d => d.trend.dynamics_scores, color: '#fdcb6e', label: 'Dynamics Control' },
+    dynamics:    {
+      scores: d => d.trend.phrase_mean_dbfs,
+      color: '#fdcb6e',
+      label: 'Mean level (dBFS)',
+      yMin: -55,
+      yMax: -15,
+      yFmt: v => `${v.toFixed(0)} dB`,
+    },
   };
 
   function renderTrendChart(data, tab) {
     if (_trendChart) { _trendChart.destroy(); _trendChart = null; }
     const trend = data.trend;
     if (!trend || !trend.phrase_labels || trend.phrase_labels.length === 0) return;
-    const { scores, color, label } = _tabColorMap[tab] || _tabColorMap.pitch;
+    const cfg = _tabColorMap[tab] || _tabColorMap.pitch;
+    const { scores, color, label } = cfg;
+    const isDb = tab === 'dynamics';
     _trendChart = new Chart(document.getElementById('trendChart'), {
       type: 'bar',
       data: {
@@ -1980,10 +2074,21 @@
         responsive: true, maintainAspectRatio: false, animation: false,
         plugins: {
           legend: { display: false },
-          tooltip: { callbacks: { label: ctx => ` ${Math.round(ctx.parsed.y)} / 100` } },
+          tooltip: {
+            callbacks: {
+              label: ctx => isDb
+                ? ` ${ctx.parsed.y.toFixed(1)} dBFS`
+                : ` ${Math.round(ctx.parsed.y)} / 100`,
+            },
+          },
         },
         scales: {
-          y: { min: 0, max: 100, grid: { color: '#252540' }, ticks: { callback: v => `${v}` } },
+          y: {
+            min: isDb ? (cfg.yMin ?? -55) : 0,
+            max: isDb ? (cfg.yMax ?? -15) : 100,
+            grid: { color: '#252540' },
+            ticks: { callback: v => (cfg.yFmt ? cfg.yFmt(v) : `${v}`) },
+          },
           x: { grid: { color: '#252540' } },
         },
       },
@@ -2019,11 +2124,14 @@
     allFrames.length    = 0;
     allSummaries.length = 0;
     allAudioPCM.length  = 0;
+    sessionAudioSamples = 0;
     latestT = 0; startTs = null; startDate = null;
     lastVoicedF0 = null; lastVoicedCentral = null; lastChartVoicedAt = 0;
     _stickySummary = null; _lastSidebarUpdate = 0; _lastChartUpdate = 0; _chartDirty = false;
     _lastGestureSticky = 0; _lastPhraseFeedback = null; _lastLiveCards = [];
     livePhraseBoundaries.length = 0;
+    allPhraseEvents.length = 0;
+    phraseReplayById = {};
     _stablePitchCat = 'in-tune'; _lastCardSig = ''; _lastCardUpdate = 0; _lastVoicedAt = 0;
     _lastGestureCat = 'steady';
     _glissStickyUntil = 0;
@@ -2090,6 +2198,7 @@
             const chunk = resampleBuf.subarray(0, FRAME);
             ws.send(chunk.buffer);
             allAudioPCM.push(new Float32Array(chunk)); // buffer for replay
+            sessionAudioSamples += chunk.length;
             resampleBuf = resampleBuf.slice(FRAME);
           }
         };

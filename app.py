@@ -4,8 +4,8 @@ Audio is captured in the BROWSER via the Web Audio API and streamed
 as raw Float32 PCM over WebSocket.
 
 Pitch: trained NanoPitch GRU model + gesture-aware scoring.
-       Steady frames are scored for ET accuracy; vibrato/glissando/transition
-       frames use widened Viterbi transitions and are excluded from accuracy.
+       Steady frames are scored for ET accuracy; glissando/transition frames get
+       a gentle slide-control penalty instead of ET scoring; vibrato is excluded.
 
 Run:  python3 app.py
 Open: http://localhost:8000
@@ -33,8 +33,10 @@ from features.pitch.gesture import (
     GESTURE_GLISSANDO,
     GESTURE_STEADY,
     GESTURE_VIBRATO,
+    VIB_PERIOD_LIVE,
     classify_gestures_live,
     gesture_name,
+    gesture_index,
     is_scored_gesture,
     merge_gesture_predictions,
     overlay_vibrato_from_deviation,
@@ -43,13 +45,17 @@ from features.pitch.gesture import (
     coalesce_glissando_labels,
     reconcile_false_glissando,
     reconcile_false_vibrato,
+    segment_has_vibrato_period,
     smooth_gesture_label,
 )
 from features.pitch.nanopitch import (
     NanoPitchExtractor, _mel_frame_from_segment,
     HOP_LENGTH as NP_HOP, WIN_LENGTH as NP_WIN, NC_CONV_CONTEXT, MEL_MIN_TAIL,
 )
+from features.pitch.accuracy import combined_pitch_score
 from features.pitch.central_pitch import compute_central_pitch
+from features.breath.phrase import _vib_score_from_params
+from features.vibrato.bandpass import bandpass_vibrato
 from features.dynamics.dynamic_class import classify_dynamic
 from features.breath.cpp import compute_cpp
 from features.breath.phrase import PhraseTracker, breath_window_from_roll
@@ -70,6 +76,7 @@ ROLLING_FRAMES = ROLLING_SECS * 100   # 300
 
 MIN_AUDIO_SAMPS = NP_WIN            # 400 samples = first mel frame
 MIN_VIB_FRAMES  = 120
+VIB_LIVE_FRAMES = 90   # ~0.9 s window for live has_vibrato (not whole rolling buffer)
 # How often to run the slower DSP operations (in chunks)
 CPP_EVERY   = 30   # every ~30 chunks ≈ 300 ms — keeps realtime proc under budget
 VIB_EVERY   = 30
@@ -252,6 +259,12 @@ def _hz_to_et(hz: float) -> tuple[float, str, float]:
     return et_hz, f"{_NOTE_NAMES[note_idx]}{octave}", float(deviation)
 
 
+def _et_deviation_cents(hz: float) -> float:
+    """Absolute cents from nearest equal-temperament note (matches live chart)."""
+    if hz <= 0:
+        return 0.0
+    return abs(_hz_to_et(hz)[2])
+
 
 # ── Per-connection state ───────────────────────────────────────────────
 @dataclass
@@ -334,15 +347,27 @@ def _track_phrases(
             c = float(central_arr[i])
             if c > 0 and not np.isnan(c):
                 central = c
-        pitch_dev = _pitch_dev_cents(f0, central)
+        _, _, et_dev_signed = _hz_to_et(f0)
+        # Phrase metrics: signed ET cents (matches chart; scoring uses median + bias).
+        pitch_dev = et_dev_signed
+        # Phrase voicing: avoid phantom voicing, but also avoid splitting on
+        # short f0 dropouts during note transitions.
+        if not hasattr(state, "_last_phrase_voiced_t"):
+            state._last_phrase_voiced_t = 0.0
+        audible = state.last_dbfs > -55.0
+        voiced_raw = (f0 > 0) and audible
+        if voiced_raw:
+            state._last_phrase_voiced_t = t
+        voiced = voiced_raw or (audible and (t - float(state._last_phrase_voiced_t)) < 0.25)
         last_info = state.phrase_tracker.update(
             float(probs[i]),
-            f0 > 0,
+            voiced,
             t,
             scored=is_scored_gesture(g),
             et_dev_cents=pitch_dev,
             gesture=g,
             cpp=state.last_cpp,
+            f0_hz=f0,
             vib_rate_hz=state.last_vib_rate_hz,
             vib_depth_cents=state.last_vib_depth_cents,
             vib_consistency=state.last_vib_consistency,
@@ -350,12 +375,21 @@ def _track_phrases(
         phrase_ids.append(last_info["phrase_id"])
         boundary = last_info.get("phrase_boundary")
         if boundary in ("start", "end"):
-            boundary_events.append({
+            ev_out: dict = {
                 "event": boundary,
                 "phrase_id": last_info.get("phrase_id", 0),
                 "t": round(t, 3),
+                "samples": int(round(t * SR)),
                 "feedback": last_info.get("phrase_feedback"),
-            })
+            }
+            m = state.phrase_tracker.metrics
+            if boundary == "start":
+                ev_out["vocal_start_t"] = round(m.start_t, 3)
+                ev_out["vocal_start_samples"] = int(round(m.start_t * SR))
+            else:
+                ev_out["vocal_end_t"] = round(m.end_t, 3)
+                ev_out["vocal_end_samples"] = int(round(m.end_t * SR))
+            boundary_events.append(ev_out)
 
     return phrase_ids, last_info, boundary_events
 
@@ -487,12 +521,18 @@ def _extract(state: ClientState, chunk: np.ndarray,
     else:
         central_latest = np.full(n_new, np.nan)
 
-    # ── CPP + tilt (every CPP_EVERY chunks; skip until buffer has real audio)
+    # ── CPP + tilt (every CPP_EVERY chunks; gate on audible voicing)
     if state.chunk_n % CPP_EVERY == 0 and state.samples_rx >= 4096:
+        voiced_count = int((f0_roll > 0).sum())
+        audible = state.last_dbfs > -55.0
         cpp_len = max(len(chunk) * CPP_EVERY, 1600)
         cpp_buf = buf[-cpp_len:].copy()
-        state.last_cpp  = float(compute_cpp(cpp_buf, sr=SR))
-        state.last_tilt = float(compute_spectral_tilt_slope(cpp_buf, sr=SR))
+        if audible and voiced_count >= 20:
+            state.last_cpp  = float(compute_cpp(cpp_buf, sr=SR))
+            state.last_tilt = float(compute_spectral_tilt_slope(cpp_buf, sr=SR))
+        else:
+            state.last_cpp = 0.0
+            state.last_tilt = 0.0
 
     # ── Vibrato (every VIB_EVERY chunks) ──────────────────────────
     if state.chunk_n % VIB_EVERY == 0:
@@ -511,18 +551,6 @@ def _extract(state: ClientState, chunk: np.ndarray,
                 pass
         else:
             state.cached_vib = np.zeros(max(len(f0_roll), 1), dtype=np.float32)
-
-        # Extract vibrato parameters from the refreshed cached signal
-        try:
-            vp = extract_vibrato_params(state.cached_vib, frame_rate_hz=100.0)
-            if vp is not None:
-                state.last_vib_consistency = vp.consistency
-                state.last_has_vibrato = vp.has_vibrato
-                if vp.has_vibrato:
-                    state.last_vib_rate_hz     = vp.rate_hz
-                    state.last_vib_depth_cents = vp.depth_cents
-        except Exception:
-            pass
 
     vib_latest = (
         state.cached_vib[-n_new:].astype(np.float32)
@@ -559,6 +587,39 @@ def _extract(state: ClientState, chunk: np.ndarray,
     for g in gesture_arr:
         state.gesture_history.append(int(g))
 
+    if state.chunk_n % VIB_EVERY == 0 and len(state.cached_vib) > 10:
+        try:
+            vib_win = state.cached_vib[-VIB_LIVE_FRAMES:]
+            vp = extract_vibrato_params(vib_win, frame_rate_hz=100.0, live=True)
+            if vp is not None:
+                state.last_vib_consistency = vp.consistency
+                hist = np.array(list(state.gesture_history)[-45:], dtype=np.int8)
+                vib_frac = (
+                    float(np.mean(hist == GESTURE_VIBRATO)) if len(hist) else 0.0
+                )
+                periodic = segment_has_vibrato_period(vib_win, **VIB_PERIOD_LIVE)
+                state.last_has_vibrato = bool(
+                    vp.has_vibrato and (vib_frac >= 0.08 or periodic),
+                )
+                if state.last_has_vibrato:
+                    state.last_vib_rate_hz     = vp.rate_hz
+                    state.last_vib_depth_cents = vp.depth_cents
+                else:
+                    state.last_vib_rate_hz     = float("nan")
+                    state.last_vib_depth_cents = float("nan")
+        except Exception:
+            pass
+
+    hist_gate = np.array(list(state.gesture_history)[-45:], dtype=np.int8)
+    vib_recent = state.cached_vib[-min(45, len(state.cached_vib)):]
+    periodic_now = (
+        segment_has_vibrato_period(vib_recent, **VIB_PERIOD_LIVE)
+        if len(vib_recent) > 15 else False
+    )
+    if len(hist_gate) and float(np.mean(hist_gate == GESTURE_VIBRATO)) < 0.06:
+        if not periodic_now:
+            state.last_has_vibrato = False
+
     # Phrase scoring uses final gestures + central-relative pitch drift.
     phrase_ids, state.phrase_info, phrase_boundary_events = _track_phrases(
         state, buf, frame_indices, f0_arr, gesture_arr, hop_s,
@@ -590,8 +651,10 @@ def _extract(state: ClientState, chunk: np.ndarray,
     glissando_active    = (
         int(np.sum(recent_slice == GESTURE_GLISSANDO)) >= max(8, int(win_len * 0.14))
     )
+    n_vib_recent = int(np.sum(recent_slice == GESTURE_VIBRATO))
     vibrato_active      = (
-        int(np.sum(recent_slice == GESTURE_VIBRATO)) >= max(7, int(win_len * 0.12))
+        n_vib_recent >= max(7, int(win_len * 0.12))
+        and (state.last_has_vibrato or periodic_now)
     )
     _, et_note, et_dev = _hz_to_et(f0_now)
 
@@ -618,27 +681,47 @@ def _extract(state: ClientState, chunk: np.ndarray,
 
     phrase_events_batch: list[dict] = []
     for be in phrase_boundary_events:
+        _bt = float(be.get("t", state.elapsed))
         ev = {
             "event": be["event"],
             "phrase_id": be.get("phrase_id", 0),
-            "t": be.get("t", state.elapsed),
+            "t": _bt,
+            "samples": int(be.get("samples", round(_bt * SR))),
             "feedback": be.get("feedback") if be["event"] == "end" else None,
         }
+        if be["event"] == "start":
+            if "vocal_start_t" in be:
+                ev["vocal_start_t"] = be["vocal_start_t"]
+            if "vocal_start_samples" in be:
+                ev["vocal_start_samples"] = be["vocal_start_samples"]
+        elif be["event"] == "end":
+            if "vocal_end_t" in be:
+                ev["vocal_end_t"] = be["vocal_end_t"]
+            if "vocal_end_samples" in be:
+                ev["vocal_end_samples"] = be["vocal_end_samples"]
         phrase_events_batch.append(ev)
         state.phrase_boundaries.append(ev)
 
     phrase_event = phrase_events_batch[-1] if phrase_events_batch else None
     if phrase_event is None and boundary in ("start", "end"):
+        _t = (
+            pi.get("phrase_start_t", 0.0) if boundary == "start"
+            else state.elapsed
+        )
         phrase_event = {
             "event": boundary,
             "phrase_id": pi.get("phrase_id", 0),
-            "t": round(
-                pi.get("phrase_start_t", 0.0) if boundary == "start"
-                else state.elapsed,
-                3,
-            ),
+            "t": round(_t, 3),
+            "samples": int(round(float(_t) * SR)),
             "feedback": pf if boundary == "end" else None,
         }
+        m = state.phrase_tracker.metrics
+        if boundary == "start":
+            phrase_event["vocal_start_t"] = round(m.start_t, 3)
+            phrase_event["vocal_start_samples"] = int(round(m.start_t * SR))
+        elif boundary == "end":
+            phrase_event["vocal_end_t"] = round(m.end_t, 3)
+            phrase_event["vocal_end_samples"] = int(round(m.end_t * SR))
         state.phrase_boundaries.append(phrase_event)
 
     return {
@@ -848,7 +931,7 @@ def _phrase_bullets(
     bullets: list[str] = []
 
     # Pitch accuracy
-    if pitch_score >= 85:
+    if pitch_score >= 82:
         bullets.append("Pitch stable")
     elif pitch_score >= 65:
         bullets.append("Pitch mostly stable")
@@ -896,17 +979,26 @@ def _phrase_bullets(
     else:
         bullets.append("Weak breath support")
 
-    # Dynamics (only if there is room)
-    if len(bullets) < 3:
-        if dbfs_std > 10.0:
-            bullets.append("Dynamics inconsistent")
-        else:
-            bullets.append("Good dynamics")
-
     return bullets[:3]
 
 
-def _run_analysis(frames: list[dict], summaries: list[dict]) -> dict:
+def _session_level_variation_db(
+    sum_dbfs: np.ndarray,
+    phrase_mean_dbfs: list[float],
+) -> tuple[float, float]:
+    """Return (session std, peak-to-peak) over voiced summaries + cross-phrase spread."""
+    voiced = sum_dbfs > -55.0
+    session_std = session_range = 0.0
+    if voiced.sum() > 5:
+        v = sum_dbfs[voiced]
+        session_std = float(np.std(v))
+        session_range = float(np.ptp(v))
+    between = float(np.std(phrase_mean_dbfs)) if len(phrase_mean_dbfs) > 1 else 0.0
+    variation = max(session_std, between, session_range * 0.45)
+    return variation, session_range
+
+
+def _run_analysis(frames: list[dict], summaries: list[dict], phrase_events: list[dict] | None = None) -> dict:
     """Run post-session analysis and return structured results."""
     if len(frames) < 20:
         return {"error": "not_enough_data", "session_score": 0,
@@ -922,10 +1014,20 @@ def _run_analysis(frames: list[dict], summaries: list[dict]) -> dict:
         [f.get("vib") if f.get("vib") is not None else float("nan") for f in frames],
         dtype=np.float32,
     )
-    # ET accuracy per frame: deviation from nearest equal-temperament note
-    et_dev  = np.array([float(f.get("et_dev_cents", 0.0)) for f in frames], dtype=np.float32)
-    # scored = True only for steady frames (excludes vibrato/glissando/transition)
+    # Signed ET deviation from nearest semitone (recompute from f0 so score matches chart).
+    et_dev = np.array(
+        [
+            _hz_to_et(float(f0[i]))[2] if f0[i] > 0 else 0.0
+            for i in range(len(f0))
+        ],
+        dtype=np.float32,
+    )
+    # scored = steady only; gliss/transition use slide-control in combined_pitch_score
     scored  = np.array([bool(f.get("scored", True)) for f in frames], dtype=bool)
+    gestures = np.array(
+        [gesture_index(str(f.get("gesture", "steady"))) for f in frames],
+        dtype=np.int8,
+    )
     t = np.array([f.get("t", i * 0.01) for i, f in enumerate(frames)], dtype=np.float32)
 
     # Estimate frame rate from timestamps
@@ -941,51 +1043,172 @@ def _run_analysis(frames: list[dict], summaries: list[dict]) -> dict:
     sum_cpp  = np.array([float(s.get("cpp",   0.0))    for s in summaries], dtype=np.float32)
     sum_dbfs = np.array([float(s.get("dbfs", -80.0))   for s in summaries], dtype=np.float32)
 
-    # ── Phrase segmentation ───────────────────────────────────────────
-    phrase_ranges = _segment_phrases(f0, t)
+    # Live phrase feedback at end boundaries (same scores the coaching card used).
+    phrase_live_feedback: dict[int, dict] = {}
+    if phrase_events:
+        for e in phrase_events:
+            if (
+                isinstance(e, dict)
+                and str(e.get("event")) == "end"
+                and e.get("feedback")
+                and int(e.get("phrase_id", 0) or 0) > 0
+            ):
+                phrase_live_feedback[int(e["phrase_id"])] = e["feedback"]
+
+    sum_has_vib = np.array(
+        [bool(s.get("has_vibrato", False)) for s in summaries], dtype=bool,
+    )
+    sum_vib_rate = np.array(
+        [float(s.get("vib_rate_hz", float("nan")) or float("nan")) for s in summaries],
+        dtype=np.float32,
+    )
+    sum_vib_depth = np.array(
+        [float(s.get("vib_depth_cents", float("nan")) or float("nan")) for s in summaries],
+        dtype=np.float32,
+    )
+    sum_vib_cons = np.array(
+        [float(s.get("vib_consistency", 0.0) or 0.0) for s in summaries],
+        dtype=np.float32,
+    )
+
+    # (frame_start, frame_end, vocal_start_t, vocal_end_t, start_sample, end_sample, phrase_id)
+    phrase_ranges: list[tuple[int, int, float, float, int, int, int]] = []
+    if phrase_events:
+        # Prefer live phrase boundaries when provided (aligns review with UI markers).
+        try:
+            events_sorted = sorted(
+                [e for e in phrase_events if isinstance(e, dict) and "event" in e and "t" in e],
+                key=lambda e: float(e.get("t", 0.0)),
+            )
+            starts: dict[int, float] = {}
+            start_samples: dict[int, int] = {}
+            vocal_start_samples: dict[int, int] = {}
+            vocal_start_t_map: dict[int, float] = {}
+            for e in events_sorted:
+                ev = str(e.get("event"))
+                pid = int(e.get("phrase_id", 0) or 0)
+                tt = float(e.get("t", 0.0) or 0.0)
+                if pid <= 0:
+                    continue
+                if ev == "start":
+                    starts[pid] = tt
+                    start_samples[pid] = int(e.get("samples", round(tt * SR)))
+                    vt = float(e.get("vocal_start_t", tt))
+                    vocal_start_t_map[pid] = vt
+                    vs = e.get("vocal_start_samples")
+                    vocal_start_samples[pid] = int(vs) if vs is not None else int(
+                        round(vt * SR)
+                    )
+                elif ev == "end" and pid in starts and tt > starts[pid]:
+                    ts = starts[pid]
+                    i0 = int(np.searchsorted(t, ts, side="left"))
+                    i1 = int(np.searchsorted(t, tt, side="right"))
+                    if i1 - i0 >= max(5, int(0.5 * fps)):
+                        v_end_t = float(e.get("vocal_end_t", tt))
+                        v_end_s = e.get("vocal_end_samples")
+                        end_s = int(v_end_s) if v_end_s is not None else int(
+                            round(v_end_t * SR)
+                        )
+                        start_s = vocal_start_samples.get(
+                            pid,
+                            start_samples.get(pid, int(round(ts * SR))),
+                        )
+                        phrase_ranges.append((
+                            max(0, i0), min(len(t), i1),
+                            vocal_start_t_map.get(pid, ts),
+                            v_end_t,
+                            start_s, end_s,
+                            pid,
+                        ))
+        except Exception:
+            phrase_ranges = []
+
+    if not phrase_ranges:
+        for i0, i1 in _segment_phrases(f0, t, min_silence_s=0.55, min_phrase_s=0.7):
+            ts = float(t[i0])
+            te = float(t[min(i1 - 1, len(t) - 1)])
+            phrase_ranges.append((
+                i0, i1, ts, te,
+                int(round(ts * SR)), int(round(te * SR)),
+                idx + 1,
+            ))
 
     # ── Phase 1: compute per-phrase metrics ───────────────────────────
     phrase_metrics: list[dict] = []
-    for idx, (start, end) in enumerate(phrase_ranges):
+    phrase_mean_dbfs_list: list[float] = []
+    for idx, (start, end, t_start, t_end, start_smp, end_smp, phrase_id) in enumerate(phrase_ranges):
         f0_p      = f0[start:end]
         central_p = central[start:end]
         vib_p     = vib[start:end]
         et_dev_p  = et_dev[start:end]
         scored_p  = scored[start:end]
-        t_start   = float(t[start])
-        t_end     = float(t[min(end - 1, len(t) - 1)])
         n_voiced  = int((f0_p > 0).sum())
 
         # Pitch accuracy = ET deviation on steady voiced frames (primary)
         # + drift stability from central pitch (secondary, detects wandering)
-        drift_results = analyze_drift(f0_p, central_p, frame_hop_s=1.0 / fps)
+        drift_results = analyze_drift(
+            f0_p,
+            central_p,
+            frame_hop_s=1.0 / fps,
+            scored_mask=scored_p & (f0_p > 0),
+        )
         drift_score   = aggregate_drift_score(drift_results)
+        gestures_p = gestures[start:end]
+        pitch_score = combined_pitch_score(
+            et_dev_p, f0_p, scored_p, drift_score, gestures_p,
+        )
 
-        et_mask = scored_p & (f0_p > 0)
-        if et_mask.sum() >= 3:
-            mean_et_dev = float(np.mean(np.abs(et_dev_p[et_mask])))
-            # 0 cents → 100, 50 cents (max possible) → 0
-            et_score = float(max(0.0, 100.0 * (1.0 - mean_et_dev / 50.0)))
-        else:
-            et_score = drift_score  # not enough steady frames, fall back
-
-        # ET accuracy is the main signal; drift catches gradual wandering
-        pitch_score = 0.75 * et_score + 0.25 * drift_score
-
-        # Vibrato parameters
+        # Vibrato: prefer live phrase-end feedback, then summary flags, then re-analysis.
         vp        = None
-        vib_score = 50.0
-        if n_voiced >= max(5, int(0.25 * fps)):
+        vib_score: float | None = None
+        has_vibrato = False
+        live_fb = phrase_live_feedback.get(int(phrase_id), {})
+        if live_fb.get("vib_score") is not None:
+            vib_score = float(live_fb["vib_score"])
+            has_vibrato = True
+        phrase_gestures = [str(f.get("gesture", "steady")) for f in frames[start:end]]
+        vib_label_frac = (
+            sum(1 for g in phrase_gestures if g == "vibrato") / max(len(phrase_gestures), 1)
+        )
+        if len(sum_t):
+            sm = (sum_t >= t_start) & (sum_t <= t_end)
+            if int(sm.sum()) > 0 and bool(np.any(sum_has_vib[sm])):
+                has_vibrato = True
+                rates = sum_vib_rate[sm]
+                depths = sum_vib_depth[sm]
+                cons = sum_vib_cons[sm]
+                vr = rates[~np.isnan(rates)]
+                vd = depths[~np.isnan(depths)]
+                vc = cons[~np.isnan(cons)]
+                if len(vr) and vib_score is None:
+                    vib_score = _vib_score_from_params(
+                        float(np.mean(vr)),
+                        float(np.mean(vd)) if len(vd) else float("nan"),
+                        float(np.mean(vc)) if len(vc) else 0.0,
+                    )
+        if vib_score is None and n_voiced >= max(5, int(0.25 * fps)):
             try:
-                vp = extract_vibrato_params(vib_p, frame_rate_hz=fps)
+                vib_sig = vib_p
+                if int(np.sum(~np.isnan(vib_sig))) < max(8, int(0.15 * len(vib_sig))):
+                    vib_sig = bandpass_vibrato(f0_p, central_p, frame_rate_hz=fps)
+                vp = extract_vibrato_params(vib_sig, frame_rate_hz=fps, live=True)
+                has_vibrato = bool(
+                    has_vibrato
+                    or (vp is not None and vp.has_vibrato)
+                    or vib_label_frac >= 0.08,
+                )
                 if vp is not None and vp.has_vibrato:
                     vib_score = float(
                         vp.rate_score * 0.4
                         + vp.depth_score * 0.4
-                        + min(100.0, vp.consistency * 400.0) * 0.2
+                        + min(100.0, vp.consistency * 400.0) * 0.2,
                     )
+                elif has_vibrato:
+                    vib_score = 58.0
             except Exception:
-                pass
+                if vib_label_frac >= 0.08:
+                    has_vibrato = True
+                    vib_score = 58.0
 
         # CPP: level + gentle within-phrase consistency penalty
         if len(sum_t):
@@ -995,61 +1218,61 @@ def _run_analysis(frames: list[dict], summaries: list[dict]) -> dict:
             cpp_arr = np.array([], dtype=np.float32)
 
         if len(cpp_arr) == 0:
-            # No CPP data in this phrase time range — neutral score
-            cpp_mean     = 0.0
+            # No CPP data in this phrase time range — treat breath as unknown.
+            cpp_mean     = float("nan")
             cpp_std      = 0.0
-            breath_score = 50.0
+            breath_score = 70.0
         else:
             cpp_mean = float(np.mean(cpp_arr))
             cpp_std  = float(np.std(cpp_arr)) if len(cpp_arr) > 2 else 0.0
-            # Piecewise-linear score calibrated to the live-UI CPP thresholds:
-            #   >10 dB (Clear voice)      → 70–100
-            #   5–10 dB (Some breathiness)→ 40–70
-            #   1.5–5 dB (Breathy)        → 10–40
-            #   <1.5 dB                   →  0–10
-            breath_score = float(np.clip(
-                np.interp(cpp_mean,
-                          [0.0,  1.5,  5.0,  10.0, 18.0],
-                          [0.0, 10.0, 40.0,  70.0, 100.0]),
-                0.0, 100.0,
-            ))
-            # Gentle within-phrase consistency penalty (caps at −15 pts).
-            # Only applied when std exceeds 2 dB (normal variation); the
-            # cross-phrase outlier flag handles larger consistency concerns.
-            if cpp_std > 2.0:
-                breath_score = max(0.0, breath_score - min(15.0, (cpp_std - 2.0) * 2.5))
+            # If CPP is near-zero it usually means "not measured" (or very unvoiced),
+            # not truly terrible breath support — keep scoring supportive.
+            if cpp_mean < 1.5:
+                breath_score = 70.0
+            else:
+                breath_score = float(np.clip(
+                    np.interp(cpp_mean,
+                              [1.5, 4.0, 7.0, 10.0, 16.0],
+                              [58.0, 68.0, 78.0, 88.0, 96.0]),
+                    48.0, 96.0,
+                ))
+                if cpp_std > 2.0:
+                    breath_score = max(48.0, breath_score - min(12.0, (cpp_std - 2.0) * 2.0))
 
-        # Dynamics control
+        # Loudness: mean level + within-phrase spread (for bullets / per-phrase chart)
         if len(sum_t):
             mask     = (sum_t >= t_start) & (sum_t <= t_end)
             dbfs_arr = sum_dbfs[mask]
         else:
             dbfs_arr = np.array([], dtype=np.float32)
-        if len(dbfs_arr) > 2:
-            dbfs_std  = float(np.std(dbfs_arr))
-            if dbfs_std < 2.0:
-                dyn_score = 60.0
-            elif dbfs_std <= 8.0:
-                dyn_score = 100.0
-            else:
-                dyn_score = float(max(0.0, 100.0 - (dbfs_std - 8.0) * 4.0))
+        voiced_dbfs = dbfs_arr[dbfs_arr > -55.0] if len(dbfs_arr) else np.array([], dtype=np.float32)
+        if len(voiced_dbfs) > 0:
+            phrase_mean_dbfs = float(np.mean(voiced_dbfs))
+            dbfs_std = float(np.std(voiced_dbfs)) if len(voiced_dbfs) > 2 else 0.0
+            phrase_range_db = float(np.ptp(voiced_dbfs)) if len(voiced_dbfs) > 1 else 0.0
         else:
-            dbfs_std  = 5.0
-            dyn_score = 75.0
+            phrase_mean_dbfs = -80.0
+            dbfs_std = 0.0
+            phrase_range_db = 0.0
+        phrase_mean_dbfs_list.append(phrase_mean_dbfs)
 
         phrase_metrics.append({
             "idx":          idx,
             "t_start":      t_start,
             "t_end":        t_end,
+            "start_sample": start_smp,
+            "end_sample":   end_smp,
             "pitch_score":  pitch_score,
             "drift_results": drift_results,
             "vp":           vp,
             "vib_score":    vib_score,
+            "has_vibrato":  has_vibrato,
             "cpp_mean":     cpp_mean,
             "cpp_std":      cpp_std,
             "breath_score": breath_score,
-            "dbfs_std":     dbfs_std,
-            "dyn_score":    dyn_score,
+            "dbfs_std":         dbfs_std,
+            "phrase_mean_dbfs": phrase_mean_dbfs,
+            "phrase_range_db":  phrase_range_db,
         })
 
     # ── Phase 2: cross-phrase breathiness outlier detection ───────────
@@ -1070,15 +1293,26 @@ def _run_analysis(frames: list[dict], summaries: list[dict]) -> dict:
         for m in phrase_metrics:
             m["is_breathy_outlier"] = False
 
+    level_variation_db, session_loudness_range_db = _session_level_variation_db(
+        sum_dbfs, phrase_mean_dbfs_list,
+    )
+    voiced_phrase_means = [x for x in phrase_mean_dbfs_list if x > -55.0]
+    session_level_med = (
+        float(np.median(voiced_phrase_means)) if voiced_phrase_means else -80.0
+    )
+
     # ── Phase 3: build final phrase results with bullets ─────────────
     phrase_results = []
     for m in phrase_metrics:
-        phrase_score = (
-            m["pitch_score"] * 0.40
-            + m["vib_score"] * 0.20
-            + m["breath_score"] * 0.25
-            + m["dyn_score"] * 0.15
-        )
+        # Phrase score: same weights as session; omit vibrato when none detected.
+        parts: list[tuple[float, float]] = [
+            (m["pitch_score"], 0.45),
+            (m["breath_score"], 0.30),
+        ]
+        if m.get("vib_score") is not None:
+            parts.insert(1, (m["vib_score"], 0.25))
+        wsum = sum(w for _, w in parts)
+        phrase_score = sum(s * w for s, w in parts) / wsum
         rating = (
             "Excellent"  if phrase_score >= 82 else
             "Good"       if phrase_score >= 62 else
@@ -1089,48 +1323,70 @@ def _run_analysis(frames: list[dict], summaries: list[dict]) -> dict:
             m["cpp_mean"], m["cpp_std"], m["dbfs_std"],
             is_breathy_outlier=m["is_breathy_outlier"],
         )
+        if len(voiced_phrase_means) > 1 and len(bullets) < 3:
+            delta = m["phrase_mean_dbfs"] - session_level_med
+            if delta >= 6.0:
+                bullets.append("Louder than your other phrases")
+            elif delta <= -6.0:
+                bullets.append("Quieter than your other phrases")
         phrase_results.append({
             "idx":            m["idx"] + 1,
             "start_t":        round(m["t_start"], 2),
             "end_t":          round(m["t_end"], 2),
+            "start_sample":   int(m["start_sample"]),
+            "end_sample":     int(m["end_sample"]),
             "rating":         rating,
             "score":          round(phrase_score, 1),
             "pitch_score":    round(m["pitch_score"], 1),
-            "vib_score":      round(m["vib_score"], 1),
+            "vib_score":      round(m["vib_score"], 1) if m.get("vib_score") is not None else None,
+            "has_vibrato":    bool(m.get("has_vibrato")),
             "breath_score":   round(m["breath_score"], 1),
-            "dynamics_score": round(m["dyn_score"], 1),
+            "phrase_mean_dbfs": round(m["phrase_mean_dbfs"], 1),
             "bullets":        bullets,
         })
 
     # ── Session-level weighted aggregates ────────────────────────────
+    vib_stab: float | None = None
     if phrase_results:
         durations = np.array([p["end_t"] - p["start_t"] for p in phrase_results], dtype=np.float64)
         total_dur = durations.sum()
         w = durations / total_dur if total_dur > 0 else np.ones(len(phrase_results)) / len(phrase_results)
         pitch_acc  = float(np.dot([p["pitch_score"]    for p in phrase_results], w))
-        vib_stab   = float(np.dot([p["vib_score"]      for p in phrase_results], w))
         breath_sup = float(np.dot([p["breath_score"]   for p in phrase_results], w))
-        dyn_ctrl   = float(np.dot([p["dynamics_score"] for p in phrase_results], w))
+        vib_phrases = [p for p in phrase_results if p.get("vib_score") is not None]
+        if vib_phrases:
+            v_w = np.array([p["end_t"] - p["start_t"] for p in vib_phrases], dtype=np.float64)
+            v_w = v_w / v_w.sum() if v_w.sum() > 0 else np.ones(len(vib_phrases)) / len(vib_phrases)
+            vib_stab = float(np.dot([p["vib_score"] for p in vib_phrases], v_w))
     else:
-        pitch_acc = vib_stab = breath_sup = dyn_ctrl = 50.0
+        pitch_acc = breath_sup = 50.0
+        level_variation_db = session_loudness_range_db = 0.0
 
-    overall = pitch_acc * 0.40 + vib_stab * 0.20 + breath_sup * 0.25 + dyn_ctrl * 0.15
+    # Session score: renormalize when vibrato was not used in the session.
+    if vib_stab is not None:
+        overall = pitch_acc * 0.45 + vib_stab * 0.25 + breath_sup * 0.30
+    else:
+        overall = (pitch_acc * 0.45 + breath_sup * 0.30) / 0.75
+
+    scores_out: dict = {
+        "pitch_accuracy":    round(pitch_acc, 1),
+        "breath_support":    round(breath_sup, 1),
+        "level_variation_db": round(level_variation_db, 1),
+        "session_loudness_range_db": round(session_loudness_range_db, 1),
+    }
+    if vib_stab is not None:
+        scores_out["vibrato_stability"] = round(vib_stab, 1)
 
     return {
         "session_score": round(overall, 1),
-        "scores": {
-            "pitch_accuracy":    round(pitch_acc, 1),
-            "vibrato_stability": round(vib_stab, 1),
-            "breath_support":    round(breath_sup, 1),
-            "dynamics_control":  round(dyn_ctrl, 1),
-        },
+        "scores": scores_out,
         "phrases": phrase_results,
         "trend": {
             "phrase_labels":   [f"P{p['idx']}" for p in phrase_results],
             "pitch_scores":    [p["pitch_score"]    for p in phrase_results],
-            "vib_scores":      [p["vib_score"]      for p in phrase_results],
+            "vib_scores":      [p["vib_score"] if p.get("vib_score") is not None else None for p in phrase_results],
             "breath_scores":   [p["breath_score"]   for p in phrase_results],
-            "dynamics_scores": [p["dynamics_score"] for p in phrase_results],
+            "phrase_mean_dbfs": [p["phrase_mean_dbfs"] for p in phrase_results],
         },
         "total_duration": round(float(t[-1]) if len(t) else 0.0, 2),
     }
@@ -1145,11 +1401,12 @@ async def analyze_session(request: Request) -> JSONResponse:
 
     frames    = body.get("frames",    [])
     summaries = body.get("summaries", [])
+    phrase_events = body.get("phrase_events", None)
 
     if not frames:
         return JSONResponse({"error": "no_data"}, status_code=400)
 
-    result = await asyncio.to_thread(_run_analysis, frames, summaries)
+    result = await asyncio.to_thread(_run_analysis, frames, summaries, phrase_events)
     return JSONResponse(result)
 
 

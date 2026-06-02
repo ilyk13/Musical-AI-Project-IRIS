@@ -40,11 +40,12 @@ def analyze_drift(
     f0_hz: np.ndarray,
     central_hz: np.ndarray,
     vad: np.ndarray | None = None,
+    scored_mask: np.ndarray | None = None,
     frame_hop_s: float = 0.010,
     min_duration_s: float = 0.15,
-    max_score_cents: float = 50.0,
+    max_score_cents: float = 55.0,
 ) -> list[DriftResult]:
-    """Analyse pitch drift across all voiced segments.
+    """Analyse pitch drift across voiced segments (optionally steady frames only).
 
     Segments shorter than `min_duration_s` are skipped (too brief to score).
 
@@ -52,6 +53,7 @@ def analyze_drift(
         f0_hz:         (T,) raw f0 from NanoPitch (0 = unvoiced)
         central_hz:    (T,) smoothed central pitch (NaN = unvoiced)
         vad:           (T,) optional VAD probabilities; if None, derived from f0_hz
+        scored_mask:   (T,) optional bool — restrict to steady/scored frames
         frame_hop_s:   seconds per frame (default 10 ms)
         min_duration_s: minimum segment length to score
         max_score_cents: deviation (cents) that maps to a score of 0
@@ -62,6 +64,8 @@ def analyze_drift(
     voiced = (f0_hz > 0) & ~np.isnan(central_hz)
     if vad is not None:
         voiced &= vad > 0.3
+    if scored_mask is not None:
+        voiced &= np.asarray(scored_mask, dtype=bool)
 
     segments = _get_voiced_segments(voiced)
     min_frames = int(round(min_duration_s / frame_hop_s))

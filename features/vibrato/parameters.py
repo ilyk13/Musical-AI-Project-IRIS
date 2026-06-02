@@ -52,7 +52,9 @@ def extract_vibrato_params(
     vibrato_signal: np.ndarray,
     frame_rate_hz: float = 100.0,
     min_duration_s: float = 0.3,
-    vibrato_energy_threshold: float = 10.0,
+    vibrato_energy_threshold: float = 16.0,
+    *,
+    live: bool = False,
 ) -> VibratoParams | None:
     """Extract vibrato parameters from a band-pass filtered vibrato signal.
 
@@ -74,6 +76,16 @@ def extract_vibrato_params(
         return None
 
     sig = vibrato_signal[valid]
+
+    if live:
+        vibrato_energy_threshold = min(vibrato_energy_threshold, 11.0)
+        min_depth_gate = 13.0
+        min_consistency_gate = 0.045
+        rate_lo, rate_hi = 3.8, 9.5
+    else:
+        min_depth_gate = 18.0
+        min_consistency_gate = 0.07
+        rate_lo, rate_hi = 4.0, 9.0
 
     # RMS amplitude — if too weak, it's not really vibrato
     rms_cents = float(np.sqrt(np.mean(sig ** 2)))
@@ -104,6 +116,20 @@ def extract_vibrato_params(
 
     # Depth: peak-to-peak amplitude in cents
     depth_cents = float(np.max(sig) - np.min(sig))
+
+    # Require energy in the vibrato band — rejects jitter / drift mislabeled as vibrato.
+    if (
+        np.isnan(rate_hz)
+        or not (rate_lo <= rate_hz <= rate_hi)
+        or consistency < min_consistency_gate
+        or depth_cents < min_depth_gate
+    ):
+        return VibratoParams(
+            start_frame=0, end_frame=n_frames, duration_s=duration_s,
+            rate_hz=rate_hz, depth_cents=depth_cents,
+            consistency=consistency, has_vibrato=False,
+            rate_score=0.0, depth_score=0.0,
+        )
 
     rate_score = _range_score(rate_hz, IDEAL_RATE_MIN, IDEAL_RATE_MAX)
     depth_score = _range_score(depth_cents / 2.0, IDEAL_DEPTH_MIN / 2.0, IDEAL_DEPTH_MAX / 2.0)

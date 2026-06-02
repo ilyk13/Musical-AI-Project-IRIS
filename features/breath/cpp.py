@@ -34,12 +34,18 @@ def compute_cpp(
     Returns:
         cpp: float in dB (higher = clearer / less breathy)
     """
-    # Power spectrum → cepstrum via log + IFFT
+    # Power spectrum → cepstrum via log + IFFT.
+    #
+    # Important: CPP is defined in dB (peak relative to a baseline), but the
+    # cepstrum here is computed from log-power. If we use natural log, CPP
+    # values end up in "nats" and look tiny (~0.1). Compute log-power in dB so
+    # CPP lands in a human-meaningful dB range (~5–25 for typical singing).
     n = len(audio_frame)
     windowed = audio_frame * np.hanning(n)
     spectrum = np.fft.rfft(windowed, n=n)
-    log_power = np.log(np.abs(spectrum) ** 2 + 1e-10)
-    cepstrum = np.fft.irfft(log_power)[:n // 2]
+    power = np.abs(spectrum) ** 2
+    log_power_db = 10.0 * np.log10(power + 1e-12)
+    cepstrum = np.fft.irfft(log_power_db)[:n // 2]
 
     quefrencies = np.arange(len(cepstrum)) / sr  # seconds
 
@@ -65,7 +71,9 @@ def compute_cpp(
     coeffs = np.polyfit(q_reg, c_reg, 1)
     baseline_at_peak = np.polyval(coeffs, peak_q)
 
-    cpp = peak_val - baseline_at_peak
+    # Empirical scale: this implementation's cepstral units are smaller than
+    # classic CPP dB ranges; rescale so typical singing lands ~5–25.
+    cpp = (peak_val - baseline_at_peak) * 12.0
     return float(max(cpp, 0.0))
 
 

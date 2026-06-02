@@ -17,8 +17,9 @@ GESTURE_VIBRATO = 1
 GESTURE_GLISSANDO = 2
 GESTURE_TRANSITION = 3
 
-# Frames with these gestures are excluded from equal-temperament accuracy.
+# Steady frames: equal-temperament accuracy. Gliss/transition: slide-control penalty only.
 SCORED_GESTURES = frozenset({GESTURE_STEADY})
+SLIDE_GESTURES = frozenset({GESTURE_GLISSANDO, GESTURE_TRANSITION})
 
 
 def gesture_name(idx: int) -> str:
@@ -29,6 +30,17 @@ def gesture_name(idx: int) -> str:
 
 def is_scored_gesture(idx: int) -> bool:
     return int(idx) in SCORED_GESTURES
+
+
+def is_slide_gesture(idx: int) -> bool:
+    return int(idx) in SLIDE_GESTURES
+
+
+def gesture_index(name: str) -> int:
+    try:
+        return GESTURE_VOCAB.index(str(name))
+    except ValueError:
+        return GESTURE_STEADY
 
 
 def is_phrase_pitch_frame(gesture: int) -> bool:
@@ -276,7 +288,7 @@ def pitch_posterior_entropy(posterior: np.ndarray) -> np.ndarray:
 # Minimum credible run length per gesture class (frames at 10 ms/frame).
 # Runs shorter than these are collapsed into their surrounding context.
 _MIN_DURATION_FRAMES: dict[int, int] = {
-    GESTURE_VIBRATO: 15,
+    GESTURE_VIBRATO: 16,
     GESTURE_TRANSITION: 5,
     GESTURE_GLISSANDO: 18,
     GESTURE_STEADY: 5,
@@ -291,8 +303,15 @@ _MIN_DURATION_TRAIN: dict[int, int] = {
 }
 
 # Live inference — slow slides ~2 ¢/frame; monotonic check blocks vibrato drift.
-_LIVE_VIBRATO = dict(percentile=72.0, depth_thr=0.012)
-_LIVE_GLISS_VIB_BLOCK = dict(percentile=58.0, depth_thr=0.009)
+_LIVE_VIBRATO = dict(percentile=80.0, depth_thr=0.016)
+_LIVE_GLISS_VIB_BLOCK = dict(percentile=62.0, depth_thr=0.011)
+# Live UI vs strict reconcile (reject jitter without blocking real vibrato).
+VIB_PERIOD_LIVE = dict(
+    min_peak_cents=11.0, min_std_cents=5.0, min_consistency=0.045, min_depth_cents=13.0,
+)
+VIB_PERIOD_STRICT = dict(
+    min_peak_cents=14.0, min_std_cents=6.0, min_consistency=0.065, min_depth_cents=17.0,
+)
 _LIVE_GLISS = dict(
     min_slope_cents=3.5, min_run=10, min_total_cents=55.0, validate_monotonic=True,
 )
@@ -516,16 +535,44 @@ def merge_gesture_predictions(
     return out
 
 
+def segment_has_vibrato_period(
+    seg_cents: np.ndarray,
+    frame_rate_hz: float = 100.0,
+    *,
+    min_peak_cents: float = 14.0,
+    min_std_cents: float = 6.0,
+    min_consistency: float = 0.07,
+    min_depth_cents: float = 18.0,
+) -> bool:
+    """True when a window has band-pass energy in the 4–9 Hz vibrato range."""
+    valid = ~np.isnan(seg_cents)
+    if valid.sum() < 15:
+        return False
+    sig = np.asarray(seg_cents[valid], dtype=np.float64)
+    peak = float(np.max(np.abs(sig)))
+    std = float(np.std(sig))
+    depth = float(np.max(sig) - np.min(sig))
+    if peak < min_peak_cents or std < min_std_cents or depth < min_depth_cents:
+        return False
+    n_fft = max(256, 2 ** int(np.ceil(np.log2(len(sig)))))
+    freqs = np.fft.rfftfreq(n_fft, d=1.0 / frame_rate_hz)
+    spectrum = np.abs(np.fft.rfft(sig, n=n_fft)) ** 2
+    vib_mask = (freqs >= 4.0) & (freqs <= 9.0)
+    if not vib_mask.any():
+        return False
+    total = float(spectrum.sum()) + 1e-10
+    consistency = float(spectrum[vib_mask].max() / total)
+    return consistency >= min_consistency
+
+
 def reconcile_false_vibrato(
     gesture: np.ndarray,
     f0: np.ndarray,
     vib_cents: np.ndarray,
     *,
-    win: int = 25,
-    amp_thr: float = 8.0,
-    std_thr: float = 3.5,
+    win: int = 30,
 ) -> np.ndarray:
-    """Downgrade vibrato labels when the band-pass deviation is too weak."""
+    """Downgrade vibrato unless the local band-pass signal is periodic in-rate."""
     out = gesture.copy()
     n = min(len(out), len(f0), len(vib_cents))
     for i in range(n):
@@ -533,11 +580,7 @@ def reconcile_false_vibrato(
             continue
         lo = max(0, i - win + 1)
         seg = vib_cents[lo:i + 1]
-        valid = ~np.isnan(seg)
-        if valid.sum() < 8:
-            continue
-        seg = seg[valid]
-        if np.max(np.abs(seg)) < amp_thr and np.std(seg) < std_thr:
+        if not segment_has_vibrato_period(seg, **VIB_PERIOD_STRICT):
             out[i] = GESTURE_STEADY
     return out
 
@@ -547,11 +590,9 @@ def reconcile_false_glissando(
     f0: np.ndarray,
     vib_cents: np.ndarray,
     *,
-    win: int = 25,
-    peak_thr: float = 10.0,
-    std_thr: float = 5.0,
+    win: int = 30,
 ) -> np.ndarray:
-    """Downgrade glissando when band-pass deviation oscillates (vibrato)."""
+    """Downgrade glissando when band-pass deviation is periodic vibrato."""
     out = gesture.copy()
     n = min(len(out), len(f0), len(vib_cents))
     for i in range(n):
@@ -559,11 +600,7 @@ def reconcile_false_glissando(
             continue
         lo = max(0, i - win + 1)
         seg = vib_cents[lo:i + 1]
-        valid = ~np.isnan(seg)
-        if valid.sum() < 10:
-            continue
-        seg = seg[valid]
-        if np.max(np.abs(seg)) >= peak_thr and np.std(seg) >= std_thr:
+        if segment_has_vibrato_period(seg, **VIB_PERIOD_LIVE):
             out[i] = GESTURE_VIBRATO
     return out
 
@@ -572,25 +609,18 @@ def overlay_vibrato_from_deviation(
     gesture: np.ndarray,
     f0: np.ndarray,
     vib_cents: np.ndarray,
-    threshold: float = 13.0,
-    win: int = 25,
-    std_thr: float = 6.0,
+    *,
+    win: int = 30,
 ) -> np.ndarray:
-    """Promote steady/glissando → vibrato when band-pass deviation matches chart."""
+    """Promote steady → vibrato only when deviation is periodic (real vibrato)."""
     out = gesture.copy()
     n = min(len(out), len(f0), len(vib_cents))
     for i in range(n):
-        if f0[i] <= 0 or out[i] not in (GESTURE_STEADY, GESTURE_GLISSANDO):
+        if f0[i] <= 0 or out[i] != GESTURE_STEADY:
             continue
         lo = max(0, i - win + 1)
         seg = vib_cents[lo:i + 1]
-        valid = ~np.isnan(seg)
-        if valid.sum() < 10:
-            continue
-        seg = seg[valid]
-        peak = float(np.max(np.abs(seg)))
-        std = float(np.std(seg))
-        if peak >= threshold and std >= std_thr:
+        if segment_has_vibrato_period(seg, **VIB_PERIOD_LIVE):
             out[i] = GESTURE_VIBRATO
     return out
 
@@ -598,26 +628,24 @@ def overlay_vibrato_from_deviation(
 def smooth_gesture_label(
     recent: np.ndarray,
     vib_recent: np.ndarray | None = None,
-    vib_threshold: float = 10.0,
+    vib_threshold: float = 11.0,
 ) -> int:
-    """Stable UI label — vibrato wins over weak glissando; slides need a strong run."""
+    """Stable UI label — vibrato when periodic energy is sustained in recent frames."""
     if vib_recent is not None and len(vib_recent) > 0:
         vib = np.asarray(vib_recent, dtype=np.float64)
-        valid = ~np.isnan(vib)
-        if valid.sum() >= 15:
-            active = valid & (np.abs(vib) >= vib_threshold)
-            if active.sum() >= max(8, int(valid.sum() * 0.18)):
-                return GESTURE_VIBRATO
-            seg = vib[valid]
-            if len(seg) >= 25 and np.std(seg) >= 6.0 and np.max(np.abs(seg)) >= vib_threshold:
-                return GESTURE_VIBRATO
+        kw = {**VIB_PERIOD_LIVE, "min_peak_cents": vib_threshold}
+        if segment_has_vibrato_period(vib, **kw):
+            if len(recent) > 0:
+                n_vib = int(np.sum(recent == GESTURE_VIBRATO))
+                if n_vib >= max(7, int(len(recent) * 0.14)):
+                    return GESTURE_VIBRATO
 
     if len(recent) > 0:
         win = len(recent)
         n_vib = int(np.sum(recent == GESTURE_VIBRATO))
         n_gliss = int(np.sum(recent == GESTURE_GLISSANDO))
         n_trans = int(np.sum(recent == GESTURE_TRANSITION))
-        if n_vib >= max(6, int(win * 0.12)):
+        if n_vib >= max(9, int(win * 0.16)):
             return GESTURE_VIBRATO
         if n_gliss >= max(8, int(win * 0.14)) and n_gliss >= n_trans:
             return GESTURE_GLISSANDO
@@ -629,7 +657,7 @@ def smooth_gesture_label(
     if len(recent) == 0:
         return GESTURE_STEADY
     n_vib = int(np.sum(recent == GESTURE_VIBRATO))
-    if n_vib >= max(8, int(len(recent) * 0.15)):
+    if n_vib >= max(9, int(len(recent) * 0.16)):
         return GESTURE_VIBRATO
     vals, counts = np.unique(recent, return_counts=True)
     return int(vals[counts.argmax()])

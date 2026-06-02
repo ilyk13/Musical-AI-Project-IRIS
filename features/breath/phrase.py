@@ -6,14 +6,20 @@ import math
 
 import numpy as np
 
-from features.pitch.gesture import GESTURE_GLISSANDO, GESTURE_STEADY, GESTURE_VIBRATO
+from features.pitch.accuracy import phrase_pitch_score_from_deviations
+from features.pitch.gesture import (
+    GESTURE_GLISSANDO,
+    GESTURE_STEADY,
+    GESTURE_VIBRATO,
+    is_slide_gesture,
+)
 
 BREATH_WINDOW = 480
-BREATH_THRESHOLD = 0.5
-MIN_BREATH_FRAMES = 4      # 40 ms sustained breath prob
-MIN_SILENCE_FRAMES = 28    # 280 ms unvoiced gap ends a confirmed phrase
-MIN_SILENCE_ABORT = 35     # 350 ms silence cancels an unconfirmed voice blip
-MIN_PHRASE_FRAMES = 35     # 350 ms voiced before a phrase is confirmed
+BREATH_THRESHOLD = 0.6
+MIN_BREATH_FRAMES = 6      # 60 ms sustained breath prob (less eager to end)
+MIN_SILENCE_FRAMES = 45    # 450 ms unvoiced gap ends a confirmed phrase
+MIN_SILENCE_ABORT = 45     # 450 ms silence cancels an unconfirmed voice blip
+MIN_PHRASE_FRAMES = 45     # 450 ms voiced before a phrase is confirmed
 MIN_PITCH_FRAMES = 3       # need ≥3 steady frames to judge pitch (matches /analyze)
 
 
@@ -118,6 +124,8 @@ class LivePhraseMetrics:
         self.start_t = 0.0
         self.end_t = 0.0
         self.deviations: list[float] = []
+        self.slide_steps: list[float] = []
+        self._last_slide_f0: float | None = None
         self.cpp_samples: list[float] = []
         self.vibrato_frames = 0
         self.glissando_frames = 0
@@ -134,13 +142,23 @@ class LivePhraseMetrics:
         et_dev_cents: float,
         gesture: int,
         cpp: float,
+        f0_hz: float = 0.0,
     ) -> None:
         self.end_t = t
         if voiced:
             self.voiced_frames += 1
         if scored:
             self.pitch_frames += 1
-            self.deviations.append(abs(float(et_dev_cents)))
+            self.deviations.append(float(et_dev_cents))
+        if is_slide_gesture(gesture) and f0_hz > 0:
+            if self._last_slide_f0 is not None and self._last_slide_f0 > 0:
+                step = abs(
+                    1200.0 * math.log2(f0_hz / self._last_slide_f0 + 1e-12)
+                )
+                self.slide_steps.append(step)
+            self._last_slide_f0 = float(f0_hz)
+        elif f0_hz > 0:
+            self._last_slide_f0 = None
         if gesture == GESTURE_STEADY:
             self.steady_frames += 1
         if gesture == GESTURE_VIBRATO:
@@ -172,15 +190,20 @@ class LivePhraseMetrics:
         vib_frac = self.vibrato_frames / max(self.voiced_frames, 1)
         gliss_frac = self.glissando_frames / max(self.voiced_frames, 1)
         has_vib = (
-            vib_frac >= 0.12
+            vib_frac >= 0.10
             and not math.isnan(vib_rate_hz)
             and not math.isnan(vib_depth_cents)
+            and vib_depth_cents >= 12.0
+            and vib_consistency >= 0.04
+            and 3.5 <= vib_rate_hz <= 9.5
         )
         has_gliss = gliss_frac >= 0.08
 
         if self.pitch_frames >= MIN_PITCH_FRAMES and self.deviations:
-            mean_dev = float(np.mean(self.deviations))
-            pitch_score = _pitch_score_from_deviation(mean_dev)
+            pitch_score = phrase_pitch_score_from_deviations(
+                self.deviations,
+                self.slide_steps or None,
+            )
             if not has_vib:
                 if pitch_score >= 88:
                     positives.append("Pitch stayed very centered")
@@ -260,10 +283,6 @@ class LivePhraseMetrics:
             rating = "good" if (phrase_score or 0) >= 52 else "warn"
             detail = positives[0] if positives else breakdown or f"{round(duration, 1)}s line"
 
-        if breakdown and not actionable:
-            detail = f"{breakdown} — {detail}" if detail and detail not in breakdown else breakdown
-        elif breakdown and actionable:
-            detail = f"{breakdown} — {detail}"
         if len(bullets) > 1 and not actionable:
             detail = f"{bullets[0]} · {bullets[1]}"
         elif len(actionable) > 1:
@@ -324,6 +343,7 @@ class PhraseTracker:
         et_dev_cents: float = 0.0,
         gesture: int = 0,
         cpp: float = 0.0,
+        f0_hz: float = 0.0,
         vib_rate_hz: float = float("nan"),
         vib_depth_cents: float = float("nan"),
         vib_consistency: float = 0.0,
@@ -353,6 +373,7 @@ class PhraseTracker:
                     et_dev_cents=et_dev_cents,
                     gesture=gesture,
                     cpp=cpp,
+                    f0_hz=f0_hz,
                 )
                 if (
                     self.pending_phrase
@@ -368,6 +389,7 @@ class PhraseTracker:
                     et_dev_cents=et_dev_cents,
                     gesture=gesture,
                     cpp=cpp,
+                    f0_hz=f0_hz,
                 )
         else:
             self.silence_run += 1
