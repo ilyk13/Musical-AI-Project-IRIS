@@ -57,6 +57,7 @@ from features.pitch.central_pitch import compute_central_pitch
 from features.breath.phrase import _vib_score_from_params
 from features.vibrato.bandpass import bandpass_vibrato
 from features.dynamics.dynamic_class import classify_dynamic
+from data.vocalset_labels import REGISTER_VOCAB, DYNAMIC_VOCAB
 from features.breath.cpp import compute_cpp
 from features.breath.phrase import PhraseTracker, breath_window_from_roll
 from features.breath.spectral_tilt import compute_spectral_tilt_slope
@@ -434,7 +435,9 @@ def _extract(state: ClientState, chunk: np.ndarray,
             base_abs = state.samples_rx - len(pending)
 
             posteriors: list[np.ndarray] = []
-            gesture_logits: list[np.ndarray] = []
+            gesture_logits:  list[np.ndarray] = []
+            register_logits: list[np.ndarray] = []
+            model_dyn_logits: list[np.ndarray] = []
             frame_ids: list[int] = []
             for i in range(n_hops):
                 hop_end = base_abs + (i + 1) * HOP_LENGTH
@@ -449,10 +452,12 @@ def _extract(state: ClientState, chunk: np.ndarray,
                 frame_t = torch.from_numpy(mel_frame).unsqueeze(0).unsqueeze(0)
                 with torch.no_grad():
                     if _extractor.has_gesture_head:
-                        _, pitch_f, gest_l, _, _, state.streaming_state = \
+                        _, pitch_f, gest_l, reg_l, dyn_l, state.streaming_state = \
                             _extractor.model.forward_single_frame(
                                 frame_t, state.streaming_state)
                         gesture_logits.append(gest_l[0, 0].cpu().numpy())
+                        register_logits.append(reg_l[0, 0].cpu().numpy())
+                        model_dyn_logits.append(dyn_l[0, 0].cpu().numpy())
                     else:
                         _, pitch_f, state.streaming_state = \
                             _extractor.model.forward_single_frame(
@@ -494,6 +499,25 @@ def _extract(state: ClientState, chunk: np.ndarray,
 
                 # Keep gesture labels from raw-track heuristics (+ model), not Viterbi f0.
                 gesture_arr = gest_arr.astype(np.int8)
+
+                # ── Register + model dynamics (NanoPitch+ only) ───────────
+                def _softmax(x: np.ndarray) -> np.ndarray:
+                    e = np.exp(x - x.max())
+                    return e / e.sum()
+
+                if register_logits:
+                    reg_probs = np.stack([_softmax(l) for l in register_logits]).mean(axis=0)
+                    state.register_prob_history.append(reg_probs)
+                    smoothed_reg = np.stack(state.register_prob_history).mean(axis=0)
+                    state.last_register      = REGISTER_VOCAB[int(smoothed_reg.argmax())]
+                    state.last_register_conf = float(smoothed_reg.max())
+
+                if model_dyn_logits:
+                    dyn_probs = np.stack([_softmax(l) for l in model_dyn_logits]).mean(axis=0)
+                    state.model_dyn_prob_history.append(dyn_probs)
+                    smoothed_dyn = np.stack(state.model_dyn_prob_history).mean(axis=0)
+                    state.last_model_dynamic = DYNAMIC_VOCAB[int(smoothed_dyn.argmax())]
+
             else:
                 gesture_arr = np.zeros(0, dtype=np.int8)
         except Exception as exc:

@@ -212,6 +212,16 @@
     .vib-param-val { font-size: 1.3rem; font-weight: 700; line-height: 1; transition: color 0.3s; }
     .vib-param-lbl { font-size: 0.6rem; color: var(--dim); text-transform: uppercase; letter-spacing: 1px; }
 
+    /* Voice character card — register colors */
+    .reg-chest    { color: var(--orange); }
+    .reg-mixed    { color: var(--green);  }
+    .reg-head     { color: var(--blue);   }
+    .reg-falsetto { color: var(--purple); }
+    .voice-char-conf {
+      font-size: 0.59rem; color: var(--dim); margin-top: 4px;
+      letter-spacing: 0.5px;
+    }
+
     /* ── Coaching Cards ────────────────────────────────────────────── */
     .coaching-section {
       background: var(--card); border: 1px solid var(--border);
@@ -601,6 +611,22 @@
         <div class="fb-label">Phrase Boundaries</div>
         <div class="fb-main dim" id="phraseVal">—</div>
         <div class="fb-sub" id="phraseSub">Markers appear on the chart</div>
+      </div>
+
+      <!-- Voice Character: register + model dynamics (NanoPitch+ only) -->
+      <div class="fb-block">
+        <div class="fb-label">Voice Character</div>
+        <div class="vib-params">
+          <div class="vib-param">
+            <div class="vib-param-val dim" id="registerVal">—</div>
+            <div class="vib-param-lbl">Register</div>
+          </div>
+          <div class="vib-param">
+            <div class="vib-param-val dim" id="modelDynVal">—</div>
+            <div class="vib-param-lbl">Level</div>
+          </div>
+        </div>
+        <div class="voice-char-conf" id="registerConf"></div>
       </div>
 
       <!-- Live Feedback coaching cards -->
@@ -1148,6 +1174,50 @@
     events.forEach(_onPhraseEvent);
   }
 
+  // ── Voice Character (register + model dynamics) ───────────────────
+  const REGISTER_COLOR = {
+    chest:    'reg-chest',
+    mixed:    'reg-mixed',
+    head:     'reg-head',
+    falsetto: 'reg-falsetto',
+  };
+
+  // Dynamic level → color class reusing the existing helpers
+  function dynLevelClass(label) {
+    if (!label) return 'dim';
+    const loud = ['f', 'ff'];
+    const soft = ['pp', 'p'];
+    if (loud.includes(label)) return 'good';
+    if (soft.includes(label)) return 'dim';
+    return 'warn';
+  }
+
+  function updateVoiceCharBlock(s, voiced) {
+    const regEl   = document.getElementById('registerVal');
+    const dynEl   = document.getElementById('modelDynVal');
+    const confEl  = document.getElementById('registerConf');
+    const hasModel = s.register != null;
+
+    if (!voiced || !hasModel) {
+      regEl.textContent = '—';  regEl.className = 'vib-param-val dim';
+      dynEl.textContent = '—';  dynEl.className = 'vib-param-val dim';
+      confEl.textContent = hasModel ? '' : 'Base model — load NanoPitch+ for register';
+      return;
+    }
+
+    const reg  = s.register;                          // 'chest'|'mixed'|'head'|'falsetto'
+    const conf = s.register_conf;                     // 0–100 integer
+    const dyn  = s.model_dynamic;                     // 'pp'|'p'|'mp'|'mf'|'f'|'ff'
+
+    regEl.textContent = reg.charAt(0).toUpperCase() + reg.slice(1);
+    regEl.className   = 'vib-param-val ' + (REGISTER_COLOR[reg] || '');
+
+    dynEl.textContent = dyn ?? '—';
+    dynEl.className   = 'vib-param-val ' + dynLevelClass(dyn);
+
+    confEl.textContent = conf != null ? `${conf}% register confidence` : '';
+  }
+
   // ── Coaching cards ────────────────────────────────────────────────
   let _stablePitchCat  = 'in-tune';
   let _lastCardSig     = '';
@@ -1538,6 +1608,7 @@
         updateBreathinessBlock(sidebar, sidebarVoiced);
         updateVibratoBlock(sidebar, sidebarVoiced);
         updatePhraseBlock(s, sidebarVoiced);
+        updateVoiceCharBlock(sidebar, sidebarVoiced);
         updateCoaching(s, displayActive);
         _lastSidebarUpdate = now;
       }
