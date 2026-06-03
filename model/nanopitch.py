@@ -50,6 +50,8 @@ Total: ~333K parameters — small enough to run on a laptop CPU or in a browser.
 - Sigmoid outputs ensure values are in [0, 1], interpretable as probabilities
 """
 
+import math
+
 import torch
 from torch import nn
 
@@ -560,40 +562,119 @@ GESTURE_TRANSITION_WIDTH = {
     GESTURE_TRANSITION: 36,
 }
 
+GESTURE_F0_FEAT_DIM = 4  # log-f0, frame delta (¢), pitch entropy, VAD prob
+
+
+def build_gesture_f0_features(
+    vad_logits: torch.Tensor,
+    pitch_logits: torch.Tensor,
+    *,
+    prev_log_f0: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Trajectory features for the gesture head (matches train + streaming).
+
+    Built from pitch/VAD logits so training matches live inference. Returns
+    (B, T, GESTURE_F0_FEAT_DIM) and per-batch previous log-f0 for streaming.
+    """
+    vad = torch.sigmoid(vad_logits.squeeze(-1))
+    pitch = torch.sigmoid(pitch_logits)
+    bins = pitch.argmax(dim=-1).float()
+    log_f0 = torch.log2(
+        PITCH_FMIN * (2.0 ** (bins * PITCH_CENTS_PER_BIN / 1200.0)) + 1e-10
+    )
+    voiced = vad > 0.3
+    log_f0 = log_f0 * voiced
+
+    log_norm = (log_f0 / 10.0).unsqueeze(-1)
+    B, T = log_f0.shape
+    device, dtype = log_f0.device, log_f0.dtype
+
+    if prev_log_f0 is None:
+        delta = torch.zeros(B, T, device=device, dtype=dtype)
+        if T > 1:
+            delta[:, 1:] = 1200.0 * (log_f0[:, 1:] - log_f0[:, :-1])
+        last_prev = log_f0[:, -1].detach()
+    else:
+        delta0 = 1200.0 * (log_f0[:, 0] - prev_log_f0.squeeze(-1))
+        delta = torch.zeros(B, T, device=device, dtype=dtype)
+        delta[:, 0] = delta0
+        if T > 1:
+            delta[:, 1:] = 1200.0 * (log_f0[:, 1:] - log_f0[:, :-1])
+        last_prev = log_f0[:, -1].detach()
+    delta = (delta.clamp(-200.0, 200.0) / 200.0 * voiced).unsqueeze(-1)
+
+    p = pitch + 1e-8
+    ent = (-(p * torch.log(p)).sum(dim=-1) / math.log(PITCH_BINS)).unsqueeze(-1)
+    vad_f = vad.unsqueeze(-1)
+    feats = torch.cat([log_norm, delta, ent, vad_f], dim=-1)
+    return feats, last_prev
+
+
+class GestureHead(nn.Module):
+    """IRIS-only gesture classifier — MLP on backbone + pitch trajectory."""
+
+    def __init__(
+        self,
+        cat_size: int,
+        n_classes: int = NUM_GESTURES,
+        hidden: int = 128,
+        f0_feat_dim: int = GESTURE_F0_FEAT_DIM,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.f0_feat_dim = f0_feat_dim
+        in_dim = cat_size + f0_feat_dim
+        h2 = max(hidden // 2, 32)
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, h2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(h2, n_classes),
+        )
+        n_params = sum(p.numel() for p in self.parameters())
+        print(f"  GestureHead: {n_params:,} parameters "
+              f"(in={in_dim}, hidden={hidden})")
+
+    def forward(self, cat: torch.Tensor, f0_feat: torch.Tensor) -> torch.Tensor:
+        return self.net(torch.cat([cat, f0_feat], dim=-1))
+
 
 class NanoPitchPlus(NanoPitch):
     """NanoPitch with gesture, register, and dynamics heads on the 384-d concat."""
 
-    def __init__(self, n_mels=N_MELS, cond_size=64, gru_size=96):
+    def __init__(
+        self,
+        n_mels=N_MELS,
+        cond_size=64,
+        gru_size=96,
+        gesture_hidden: int = 128,
+        use_f0_gesture_feats: bool = True,
+    ):
         super().__init__(n_mels=n_mels, cond_size=cond_size, gru_size=gru_size)
         cat_size = gru_size * 4
-        self.dense_gesture = nn.Linear(cat_size, NUM_GESTURES)
+        self.use_f0_gesture_feats = use_f0_gesture_feats
+        f0_dim = GESTURE_F0_FEAT_DIM if use_f0_gesture_feats else 0
+        self.gesture_head = GestureHead(
+            cat_size, hidden=gesture_hidden, f0_feat_dim=f0_dim,
+        )
         self.dense_register = nn.Linear(cat_size, NUM_REGISTERS)
         self.dense_dynamics = nn.Linear(cat_size, NUM_DYNAMICS)
         n_params = sum(p.numel() for p in self.parameters())
         print(f"NanoPitchPlus: {n_params:,} parameters "
-              f"(cond={cond_size}, gru={gru_size})")
+              f"(cond={cond_size}, gru={gru_size}, gesture_hidden={gesture_hidden})")
 
-    def _heads(self, cat, return_logits=False):
-        vad_logits = self.dense_vad(cat)
-        pitch_logits = self.dense_pitch(cat)
-        gesture_logits = self.dense_gesture(cat)
-        register_logits = self.dense_register(cat)
-        dynamics_logits = self.dense_dynamics(cat)
-        if return_logits:
-            return vad_logits, pitch_logits, gesture_logits, register_logits, dynamics_logits
-        return (
-            torch.sigmoid(vad_logits),
-            torch.sigmoid(pitch_logits),
-            gesture_logits,
-            register_logits,
-            dynamics_logits,
-        )
+    def init_streaming_state(self, device='cpu'):
+        state = super().init_streaming_state(device)
+        state['gesture_prev_log_f0'] = torch.zeros(1, device=device)
+        return state
 
-    def forward(self, mel, states=None, return_logits=False):
+    def _encode(self, mel, states=None):
+        """Shared mel → concat features (+ GRU states)."""
         B = mel.size(0)
         device = mel.device
-
         if states is None:
             h1 = torch.zeros(1, B, self.gru_size, device=device)
             h2 = torch.zeros(1, B, self.gru_size, device=device)
@@ -612,9 +693,50 @@ class NanoPitchPlus(NanoPitch):
         g2, h2 = self.gru2(g1, h2)
         g3, h3 = self.gru3(g2, h3)
         cat = torch.cat([x, g1, g2, g3], dim=-1)
+        return cat, [h1, h2, h3]
 
-        out = self._heads(cat, return_logits=return_logits)
-        return (*out, [h1, h2, h3])
+    def _heads(
+        self,
+        cat,
+        vad_logits,
+        pitch_logits,
+        *,
+        return_logits=False,
+        gesture_prev_log_f0=None,
+    ):
+        f0_feat = torch.zeros(
+            *cat.shape[:-1], 0, device=cat.device, dtype=cat.dtype,
+        )
+        new_prev = gesture_prev_log_f0
+        if self.use_f0_gesture_feats:
+            f0_feat, new_prev = build_gesture_f0_features(
+                vad_logits, pitch_logits, prev_log_f0=gesture_prev_log_f0,
+            )
+        gesture_logits = self.gesture_head(cat, f0_feat)
+        register_logits = self.dense_register(cat)
+        dynamics_logits = self.dense_dynamics(cat)
+        if return_logits:
+            return (
+                vad_logits, pitch_logits, gesture_logits,
+                register_logits, dynamics_logits, new_prev,
+            )
+        return (
+            torch.sigmoid(vad_logits),
+            torch.sigmoid(pitch_logits),
+            gesture_logits,
+            register_logits,
+            dynamics_logits,
+            new_prev,
+        )
+
+    def forward(self, mel, states=None, return_logits=False):
+        cat, gru_states = self._encode(mel, states)
+        vad_logits = self.dense_vad(cat)
+        pitch_logits = self.dense_pitch(cat)
+        out = self._heads(
+            cat, vad_logits, pitch_logits, return_logits=return_logits,
+        )
+        return (*out[:-1], gru_states)
 
     def forward_single_frame(self, mel_frame, states, return_logits=False):
         conv1_buf = states['conv1_buf']
@@ -637,13 +759,21 @@ class NanoPitchPlus(NanoPitch):
         g3, h3 = self.gru3(g2, h3)
         cat = torch.cat([x, g1, g2, g3], dim=-1)
 
-        out = self._heads(cat, return_logits=return_logits)
+        vad_logits = self.dense_vad(cat)
+        pitch_logits = self.dense_pitch(cat)
+        prev = states.get('gesture_prev_log_f0')
+        out = self._heads(
+            cat, vad_logits, pitch_logits,
+            return_logits=return_logits,
+            gesture_prev_log_f0=prev,
+        )
         new_states = {
             'conv1_buf': conv1_buf,
             'conv2_buf': conv2_buf,
             'gru_states': [h1, h2, h3],
+            'gesture_prev_log_f0': out[-1],
         }
-        return (*out, new_states)
+        return (*out[:-1], new_states)
 
     @classmethod
     def from_nanopitch_checkpoint(cls, ckpt_path, device='cpu'):
@@ -653,6 +783,8 @@ class NanoPitchPlus(NanoPitch):
         model = cls(
             cond_size=kwargs.get("cond_size", 64),
             gru_size=kwargs.get("gru_size", 96),
+            gesture_hidden=kwargs.get("gesture_hidden", 128),
+            use_f0_gesture_feats=kwargs.get("use_f0_gesture_feats", True),
         )
         state = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
         missing, unexpected = model.load_state_dict(state, strict=False)

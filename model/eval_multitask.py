@@ -59,8 +59,10 @@ def load_plus(checkpoint: str, device: torch.device) -> tuple[NanoPitchPlus, dic
     model = NanoPitchPlus(
         cond_size=kwargs.get("cond_size", 64),
         gru_size=kwargs.get("gru_size", 96),
+        gesture_hidden=kwargs.get("gesture_hidden", 128),
+        use_f0_gesture_feats=kwargs.get("use_f0_gesture_feats", True),
     ).to(device)
-    model.load_state_dict(ckpt["state_dict"])
+    model.load_state_dict(ckpt["state_dict"], strict=False)
     model.eval()
     meta = {
         "epoch": ckpt.get("epoch"),

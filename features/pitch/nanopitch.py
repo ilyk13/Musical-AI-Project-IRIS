@@ -128,6 +128,8 @@ class NanoPitchExtractor:
                 model = NanoPitchPlus(
                     cond_size=kwargs.get("cond_size", 64),
                     gru_size=kwargs.get("gru_size", 96),
+                    gesture_hidden=kwargs.get("gesture_hidden", 128),
+                    use_f0_gesture_feats=kwargs.get("use_f0_gesture_feats", True),
                 )
                 model.load_state_dict(ckpt["state_dict"], strict=False)
             else:
@@ -143,7 +145,10 @@ class NanoPitchExtractor:
         print(f"Loaded {kind} weights from {local_path}")
         return cls(model, device)
 
-    _PLUS_HEAD_PREFIXES = ("dense_gesture.", "dense_register.", "dense_dynamics.")
+    _PLUS_HEAD_PREFIXES = (
+        "gesture_head.", "dense_gesture.",
+        "dense_register.", "dense_dynamics.",
+    )
 
     @classmethod
     def from_hybrid_checkpoints(
@@ -167,6 +172,8 @@ class NanoPitchExtractor:
         model = NanoPitchPlus(
             cond_size=kwargs.get("cond_size", 64),
             gru_size=kwargs.get("gru_size", 96),
+            gesture_hidden=kwargs.get("gesture_hidden", 128),
+            use_f0_gesture_feats=kwargs.get("use_f0_gesture_feats", True),
         )
         model.load_state_dict(pitch_sd, strict=False)
         head_sd = {

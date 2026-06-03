@@ -53,6 +53,8 @@ parser.add_argument("--resume", default=None,
 parser.add_argument("--device", default="auto")
 parser.add_argument("--cond-size", type=int, default=64)
 parser.add_argument("--gru-size", type=int, default=96)
+parser.add_argument("--gesture-hidden", type=int, default=128,
+                    help="Hidden units in GestureHead MLP (IRIS-only)")
 parser.add_argument("--epochs", type=int, default=30)
 parser.add_argument("--batch-size", type=int, default=16)
 parser.add_argument("--lr", type=float, default=5e-4)
@@ -82,14 +84,27 @@ parser.add_argument(
     "--glissando-weight-cap",
     type=float,
     default=6.0,
-    help="Higher cap for glissando class weight (rarest gesture)",
+    help="Higher cap for glissando class weight",
 )
-parser.add_argument("--focal-gamma", type=float, default=1.0)
+parser.add_argument(
+    "--transition-weight-cap",
+    type=float,
+    default=5.0,
+    help="Cap for transition class weight (rarest in train)",
+)
+parser.add_argument(
+    "--rare-gesture-oversample",
+    type=int,
+    default=3,
+    help="Extra copies of train segments containing glissando or transition",
+)
+parser.add_argument("--focal-gamma", type=float, default=2.0,
+                    help="Focal loss gamma (higher = more focus on hard frames)")
 parser.add_argument(
     "--freeze-backbone-epochs",
     type=int,
     default=20,
-    help="Train only dense_gesture; backbone frozen (0=disabled)",
+    help="Train only gesture_head; backbone frozen (0=disabled)",
 )
 parser.add_argument(
     "--unfreeze-lr",
@@ -106,8 +121,14 @@ parser.add_argument(
 parser.add_argument(
     "--min-vibrato-precision",
     type=float,
-    default=0.35,
+    default=0.22,
     help="Minimum vibrato precision to allow best.pth",
+)
+parser.add_argument(
+    "--min-transition-recall",
+    type=float,
+    default=0.06,
+    help="Minimum transition recall to allow best.pth",
 )
 parser.add_argument(
     "--min-vibrato-recall",
@@ -136,7 +157,13 @@ parser.add_argument(
 
 
 class VocalSetDataset(Dataset):
-    def __init__(self, npz_path: str, noise_npz: str | None, seq_len: int = 200):
+    def __init__(
+        self,
+        npz_path: str,
+        noise_npz: str | None,
+        seq_len: int = 200,
+        rare_gesture_oversample: int = 3,
+    ):
         self.seq_len = seq_len
         data = np.load(npz_path, allow_pickle=True)
         self.mel = data["mel"].astype(np.float32)
@@ -154,8 +181,9 @@ class VocalSetDataset(Dataset):
             g = self.gesture[start:end]
             if np.any(g == 2) or np.any(g == 3):
                 extra.append((start, end))
-        if extra:
-            self.segs = self.segs + extra * 2
+        n_extra = max(0, int(rare_gesture_oversample))
+        if extra and n_extra > 0:
+            self.segs = self.segs + extra * n_extra
 
         self.noise_mel = None
         self.noise_segs = []
@@ -205,6 +233,7 @@ def compute_gesture_class_weights(
     n_classes: int = 4,
     max_ratio: float = 3.0,
     glissando_cap: float = 6.0,
+    transition_cap: float = 5.0,
 ) -> np.ndarray:
     """Inverse-frequency weights, normalized to min=1 with per-class caps."""
     gesture = np.load(train_npz, allow_pickle=True)["gesture"].astype(np.int64)
@@ -212,8 +241,12 @@ def compute_gesture_class_weights(
     counts = np.maximum(counts, 1.0)
     weights = gesture.size / (n_classes * counts)
     weights /= weights.min()
+    caps = {
+        2: glissando_cap,   # glissando
+        3: transition_cap,  # transition
+    }
     for i in range(n_classes):
-        cap = glissando_cap if i == 2 else max_ratio  # GESTURE_GLISSANDO
+        cap = caps.get(i, max_ratio)
         weights[i] = min(weights[i], max(1.0, float(cap)))
     weights /= weights.sum()
     weights *= n_classes
@@ -221,9 +254,9 @@ def compute_gesture_class_weights(
 
 
 def set_gesture_only_phase(model: NanoPitchPlus, gesture_only: bool) -> None:
-    """Freeze conv/GRU/VAD/pitch; train dense_gesture only when gesture_only=True."""
+    """Freeze conv/GRU/VAD/pitch; train gesture_head only when gesture_only=True."""
     for name, param in model.named_parameters():
-        param.requires_grad = name.startswith("dense_gesture") if gesture_only else True
+        param.requires_grad = name.startswith("gesture_head") if gesture_only else True
 
 
 def _gesture_metrics_from_cm(cm: np.ndarray) -> dict:
@@ -258,17 +291,30 @@ def _gesture_metrics_from_cm(cm: np.ndarray) -> dict:
     }
 
 
+def _gesture_selection_score(metrics: dict) -> float:
+    """Prefer balanced quality over macro F1 alone (v4 over-predicted motion)."""
+    macro = metrics.get("macro_f1", 0.0)
+    bal = metrics.get("balanced_acc", 0.0)
+    steady = metrics.get("steady_recall", 0.0)
+    trans = metrics.get("transition_recall", 0.0)
+    return macro * 0.55 + bal * 0.30 + steady * 0.10 + trans * 0.05
+
+
 def _qualifies_for_best(metrics: dict, args) -> bool:
     vib_prec = metrics.get("vibrato_precision", 0.0)
     vib_rec = metrics.get("vibrato_recall", 0.0)
-    return (
+    trans_rec = metrics.get("transition_recall", 0.0)
+    gates = (
         metrics.get("steady_recall", 0.0) >= args.min_steady_recall
         and metrics.get("rpa_std", 0.0) >= args.min_rpa_for_best
-        and (
-            vib_prec >= args.min_vibrato_precision
-            or vib_rec >= args.min_vibrato_recall
-        )
+        and trans_rec >= args.min_transition_recall
     )
+    if not gates:
+        return False
+    if vib_prec >= args.min_vibrato_precision:
+        return True
+    # Early training: allow recall-only if precision is not catastrophic
+    return vib_rec >= args.min_vibrato_recall and vib_prec >= 0.12
 
 
 def focal_cross_entropy(
@@ -333,9 +379,10 @@ def train_one_epoch(model, loader, optimizer, scheduler, writer, epoch, device, 
         vad_weight = 0.5 * (1.0 - vad_t) + 3.0 * vad_t
         vad_loss = (vad_weight * bce_vad(vad_l.squeeze(-1), vad_t)).mean()
         pitch_loss = (vad_t.unsqueeze(-1) * bce_pitch(pitch_l, pitch_target)).mean()
+        voiced = ((vad_t > 0.5) | (f0_t > 0)).reshape(-1)
         gesture_loss = focal_cross_entropy(
-            gest_l.reshape(-1, gest_l.shape[-1]),
-            gest_t.reshape(-1),
+            gest_l.reshape(-1, gest_l.shape[-1])[voiced],
+            gest_t.reshape(-1)[voiced],
             gamma=args.focal_gamma,
             class_weight=getattr(args, "gesture_class_weight", None),
         )
@@ -477,8 +524,14 @@ def evaluate(model, val_path, device, writer, epoch, max_clips: int = 0) -> dict
     print(f"  val clips: {n_clips}  gesture acc: {acc:.1%}  "
           f"(majority {GESTURE_VOCAB[majority]} {maj_acc:.1%})")
     print(f"  gesture macro F1: {macro_f1:.1%}  balanced acc: {extra['balanced_acc']:.1%}")
+    trans_rec = extra["per_class_recall"].get(GESTURE_VOCAB[3])
+    gliss_prec = extra["per_class_precision"].get(GESTURE_VOCAB[2])
     print(f"  steady recall: {extra['steady_recall']:.1%}  "
           f"vibrato prec/rec: {extra['vibrato_precision']:.1%} / {extra['vibrato_recall']:.1%}")
+    if trans_rec is not None:
+        print(f"  transition recall: {trans_rec:.1%}")
+    if gliss_prec is not None:
+        print(f"  glissando precision: {gliss_prec:.1%}")
     for name, rec in extra["per_class_recall"].items():
         if rec is not None:
             print(f"    recall {name}: {rec:.1%}")
@@ -490,6 +543,8 @@ def evaluate(model, val_path, device, writer, epoch, max_clips: int = 0) -> dict
     if rpa_gest:
         print(f"  RPA (gesture Viterbi):  {np.mean(rpa_gest):.1%}")
 
+    trans_rec = extra["per_class_recall"].get(GESTURE_VOCAB[3]) or 0.0
+    gliss_prec = extra["per_class_precision"].get(GESTURE_VOCAB[2]) or 0.0
     return {
         "macro_f1": macro_f1,
         "gesture_acc": acc,
@@ -497,6 +552,8 @@ def evaluate(model, val_path, device, writer, epoch, max_clips: int = 0) -> dict
         "steady_recall": extra["steady_recall"],
         "vibrato_precision": extra["vibrato_precision"],
         "vibrato_recall": extra["vibrato_recall"],
+        "transition_recall": trans_rec if trans_rec is not None else 0.0,
+        "glissando_precision": gliss_prec if gliss_prec is not None else 0.0,
         "balanced_acc": extra["balanced_acc"],
     }
 
@@ -509,6 +566,7 @@ def _load_model_for_eval_or_train(args, device: torch.device) -> NanoPitchPlus:
             state = ckpt["state_dict"]
             is_plus = (
                 ckpt.get("model_type") == "NanoPitchPlus"
+                or "gesture_head.net.0.weight" in state
                 or "dense_gesture.weight" in state
             )
             if is_plus:
@@ -516,15 +574,25 @@ def _load_model_for_eval_or_train(args, device: torch.device) -> NanoPitchPlus:
                 model = NanoPitchPlus(
                     cond_size=kwargs.get("cond_size", args.cond_size),
                     gru_size=kwargs.get("gru_size", args.gru_size),
+                    gesture_hidden=kwargs.get("gesture_hidden", args.gesture_hidden),
+                    use_f0_gesture_feats=kwargs.get("use_f0_gesture_feats", True),
                 )
-                model.load_state_dict(state)
+                missing, unexpected = model.load_state_dict(state, strict=False)
+                if missing:
+                    print(f"  (new / missing keys: {len(missing)})")
+                if unexpected:
+                    print(f"  (ignored keys: {len(unexpected)})")
                 print(f"Loaded NanoPitchPlus from {args.resume}")
                 return model.to(device)
         # Base NanoPitch / exp4: shared layers only; gesture/register/dynamics heads stay random
         model = NanoPitchPlus.from_nanopitch_checkpoint(args.resume, device="cpu")
         print(f"Loaded base NanoPitch weights from {args.resume} (Plus heads initialized randomly)")
         return model.to(device)
-    return NanoPitchPlus(cond_size=args.cond_size, gru_size=args.gru_size).to(device)
+    return NanoPitchPlus(
+        cond_size=args.cond_size,
+        gru_size=args.gru_size,
+        gesture_hidden=args.gesture_hidden,
+    ).to(device)
 
 
 def main():
@@ -567,7 +635,10 @@ def main():
         return 1
 
     noise_npz = os.path.join(args.noise_dir, "noise.npz")
-    train_ds = VocalSetDataset(train_npz, noise_npz, args.seq_len)
+    train_ds = VocalSetDataset(
+        train_npz, noise_npz, args.seq_len,
+        rare_gesture_oversample=args.rare_gesture_oversample,
+    )
     loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
@@ -584,6 +655,7 @@ def main():
             train_npz,
             max_ratio=args.gesture_weight_max_ratio,
             glissando_cap=args.glissando_weight_cap,
+            transition_cap=args.transition_weight_cap,
         )
         args.gesture_class_weight = torch.tensor(gw, device=device)
         print("Gesture class weights (capped):",
@@ -592,12 +664,13 @@ def main():
         args.gesture_class_weight = None
 
     freeze_epochs = max(0, args.freeze_backbone_epochs)
-    if freeze_epochs >= args.epochs:
-        print("[WARNING] freeze-backbone-epochs >= total epochs; disabling freeze.")
-        freeze_epochs = 0
+    if freeze_epochs > args.epochs:
+        print(f"[WARNING] freeze-backbone-epochs ({freeze_epochs}) > epochs "
+              f"({args.epochs}); capping to all-epochs gesture-only.")
+        freeze_epochs = args.epochs
 
     writer = SummaryWriter(log_dir=os.path.join(output_dir, "tb"))
-    best_macro_f1 = -1.0
+    best_gesture_score = -1.0
     eval_max = args.eval_max_clips
     optimizer = scheduler = None
 
@@ -644,7 +717,8 @@ def main():
         val_metrics = {
             "macro_f1": 0.0, "gesture_acc": 0.0, "rpa_std": 0.0,
             "steady_recall": 0.0, "vibrato_precision": 0.0, "vibrato_recall": 0.0,
-        "balanced_acc": 0.0,
+            "transition_recall": 0.0, "glissando_precision": 0.0,
+            "balanced_acc": 0.0,
         }
         if epoch % args.eval_every == 0 or epoch == args.epochs:
             val_metrics = evaluate(
@@ -656,7 +730,12 @@ def main():
             "state_dict": model.state_dict(),
             "optimizer": optimizer.state_dict() if optimizer else {},
             "scheduler": scheduler.state_dict() if scheduler else {},
-            "model_kwargs": {"cond_size": args.cond_size, "gru_size": args.gru_size},
+            "model_kwargs": {
+                "cond_size": args.cond_size,
+                "gru_size": args.gru_size,
+                "gesture_hidden": args.gesture_hidden,
+                "use_f0_gesture_feats": True,
+            },
             "model_type": "NanoPitchPlus",
             "loss": loss,
             "val_macro_f1": val_metrics["macro_f1"],
@@ -668,11 +747,15 @@ def main():
         torch.save(ckpt, os.path.join(ckpt_dir, f"epoch_{epoch:03d}.pth"))
 
         ok = _qualifies_for_best(val_metrics, args)
-        if ok and val_metrics["macro_f1"] > best_macro_f1:
-            best_macro_f1 = val_metrics["macro_f1"]
+        sel_score = _gesture_selection_score(val_metrics)
+        if ok and sel_score > best_gesture_score:
+            best_gesture_score = sel_score
             torch.save(ckpt, os.path.join(ckpt_dir, "best.pth"))
-            print(f"  → new best.pth  macro F1={best_macro_f1:.1%}  "
-                  f"steady recall={val_metrics['steady_recall']:.1%}  "
+            print(f"  → new best.pth  score={sel_score:.3f}  "
+                  f"macro F1={val_metrics['macro_f1']:.1%}  "
+                  f"balanced={val_metrics['balanced_acc']:.1%}  "
+                  f"steady rec={val_metrics['steady_recall']:.1%}  "
+                  f"trans rec={val_metrics.get('transition_recall', 0):.1%}  "
                   f"vibrato prec={val_metrics['vibrato_precision']:.1%}  "
                   f"RPA={val_metrics['rpa_std']:.1%}")
         elif epoch % args.eval_every == 0 or epoch == args.epochs:
@@ -691,20 +774,25 @@ def main():
                 )
             if val_metrics["rpa_std"] < args.min_rpa_for_best:
                 why.append(f"RPA {val_metrics['rpa_std']:.1%} < {args.min_rpa_for_best:.0%}")
+            if val_metrics.get("transition_recall", 0) < args.min_transition_recall:
+                why.append(
+                    f"transition recall {val_metrics.get('transition_recall', 0):.1%} "
+                    f"< {args.min_transition_recall:.0%}"
+                )
             if why:
                 print(f"  (skipped best.pth: {'; '.join(why)})")
 
     writer.close()
-    if best_macro_f1 < 0:
+    if best_gesture_score < 0:
         print("Done. No checkpoint met best.pth gates "
               f"(steady recall ≥{args.min_steady_recall:.0%}, "
-              f"vibrato precision ≥{args.min_vibrato_precision:.0%}, "
+              f"transition recall ≥{args.min_transition_recall:.0%}, "
+              f"vibrato precision ≥{args.min_vibrato_precision:.0%} or recall fallback, "
               f"RPA ≥{args.min_rpa_for_best:.0%}).")
         print(f"Pick manually from: {ckpt_dir}")
     else:
-        print(f"Done. best.pth macro F1={best_macro_f1:.1%} "
-              f"(steady recall ≥{args.min_steady_recall:.0%}, "
-              f"vibrato precision ≥{args.min_vibrato_precision:.0%}, "
+        print(f"Done. best.pth selection score={best_gesture_score:.3f} "
+              f"(steady ≥{args.min_steady_recall:.0%}, transition ≥{args.min_transition_recall:.0%}, "
               f"RPA ≥{args.min_rpa_for_best:.0%}).")
     print(f"Full val: python3 model/eval_multitask.py --checkpoint {ckpt_dir}/best.pth")
     print(f"Checkpoints: {ckpt_dir}")
