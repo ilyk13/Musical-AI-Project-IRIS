@@ -4,7 +4,7 @@ Audio is captured in the BROWSER via the Web Audio API and streamed
 as raw Float32 PCM over WebSocket.
 
 Pitch: trained NanoPitch GRU model + gesture-aware scoring.
-       Steady frames are scored for ET accuracy; glissando/transition frames get
+       Steady frames are scored for ET accuracy; glissando frames use slide-control only.
        a gentle slide-control penalty instead of ET scoring; vibrato is excluded.
 
 Run:  python3 app.py
@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from features.pitch.gesture import (
     GESTURE_GLISSANDO,
     GESTURE_STEADY,
+    GESTURE_TRANSITION,
     GESTURE_VIBRATO,
     VIB_PERIOD_LIVE,
     classify_gestures_live,
@@ -59,7 +60,13 @@ from features.vibrato.bandpass import bandpass_vibrato
 from features.dynamics.dynamic_class import classify_dynamic
 from data.vocalset_labels import REGISTER_VOCAB, DYNAMIC_VOCAB
 from features.breath.cpp import compute_cpp
-from features.breath.phrase import PhraseTracker, breath_window_from_roll, MIN_PHRASE_FRAMES
+from features.breath.phrase import (
+    PhraseTracker,
+    breath_window_from_roll,
+    MIN_GAP_BREATH_PEAK,
+    MIN_PHRASE_FRAMES,
+    MIN_SILENCE_BREATH_GAP,
+)
 from features.breath.spectral_tilt import compute_spectral_tilt_slope
 from features.vibrato.bandpass import bandpass_vibrato
 from features.vibrato.parameters import extract_vibrato_params
@@ -80,6 +87,15 @@ ROLLING_FRAMES = ROLLING_SECS * 100   # 300
 MIN_AUDIO_SAMPS = NP_WIN            # 400 samples = first mel frame
 MIN_VIB_FRAMES  = 120
 VIB_LIVE_FRAMES = 90   # ~0.9 s window for live has_vibrato (not whole rolling buffer)
+# Live voicing gates — stricter than chart hold so room noise does not coach / phrase.
+LIVE_AUDIBLE_DBFS = -50.0
+LIVE_PITCH_CONF_MIN = 0.14
+LIVE_PHRASE_CONF_MIN = 0.10   # continue an open line
+LIVE_PHRASE_START_CONF_MIN = 0.12  # stricter gate to begin a new line
+# Note-to-note hop vs breath-between-lyrics (frames at 10 ms).
+PHRASE_NOTE_HOP_MAX_FRAMES = 10   # ≤100 ms f0 dip, no inhale → same lyric line
+PHRASE_BREATH_PEAK_MIN = MIN_GAP_BREATH_PEAK  # match tracker breath-gap end
+PHRASE_DECODE_BRIDGE_MAX_FRAMES = 5  # ≤50 ms pitch dropout after a sung frame
 # How often to run the slower DSP operations (in chunks)
 CPP_EVERY   = 30   # every ~30 chunks ≈ 300 ms — keeps realtime proc under budget
 VIB_EVERY   = 30
@@ -342,6 +358,12 @@ class ClientState:
     phrase_info:        dict = field(default_factory=dict)
     phrase_boundaries:  list = field(default_factory=list)
     gesture_feat_stream: object | None = field(default=None)
+    register_prob_history: deque = field(default_factory=lambda: deque(maxlen=12))
+    model_dyn_prob_history: deque = field(default_factory=lambda: deque(maxlen=12))
+    last_pitch_conf: float = 0.0
+    vocal_active: bool = False
+    phrase_gap_frames: int = 0
+    phrase_gap_breath_peak: float = 0.0
 
 
 def _pitch_dev_cents(hz: float, central_hz: float | None) -> float:
@@ -354,6 +376,26 @@ def _pitch_dev_cents(hz: float, central_hz: float | None) -> float:
     return abs(et_dev)
 
 
+def _frame_voiced_for_phrase(
+    state: ClientState,
+    f0_hz: float,
+    pitch_conf: float,
+    t: float,
+    *,
+    starting_line: bool = False,
+) -> bool:
+    """Voicing for phrase boundaries — silent frames are never phrase audio."""
+    if f0_hz <= 0 or state.last_dbfs < LIVE_AUDIBLE_DBFS:
+        return False
+    conf_min = (
+        LIVE_PHRASE_START_CONF_MIN if starting_line else LIVE_PHRASE_CONF_MIN
+    )
+    if pitch_conf < conf_min:
+        return False
+    state._last_phrase_voiced_t = t  # type: ignore[attr-defined]
+    return True
+
+
 def _track_phrases(
     state: ClientState,
     buf: np.ndarray,
@@ -362,6 +404,7 @@ def _track_phrases(
     gesture_arr: np.ndarray,
     hop_s: float,
     central_arr: np.ndarray | None = None,
+    pitch_conf_arr: np.ndarray | None = None,
 ) -> tuple[list[int], dict, list[dict]]:
     """Update phrase tracker; return per-frame phrase ids, summary, and boundary events."""
     n = len(f0_arr)
@@ -369,7 +412,14 @@ def _track_phrases(
         return [], state.phrase_tracker.snapshot(), []
 
     probs = np.zeros(n, dtype=np.float32)
-    if _breath_model is not None and len(frame_indices) == n:
+    if _breath_model is not None and n > 0:
+        if len(frame_indices) != n:
+            base_fi = frame_indices[-1] if frame_indices else max(
+                0, state.samples_rx // HOP_LENGTH - n,
+            )
+            frame_indices = [
+                max(0, base_fi - (n - 1 - i)) for i in range(n)
+            ]
         windows = np.stack([
             breath_window_from_roll(
                 buf, state.samples_rx, fi,
@@ -397,17 +447,57 @@ def _track_phrases(
         _, _, et_dev_signed = _hz_to_et(f0)
         # Phrase metrics: signed ET cents (matches chart; scoring uses median + bias).
         pitch_dev = et_dev_signed
-        # Phrase voicing: avoid phantom voicing, but also avoid splitting on
-        # short f0 dropouts during note transitions.
-        if not hasattr(state, "_last_phrase_voiced_t"):
-            state._last_phrase_voiced_t = 0.0
-        audible = state.last_dbfs > -55.0
-        voiced_raw = (f0 > 0) and audible
-        if voiced_raw:
-            state._last_phrase_voiced_t = t
-        voiced = voiced_raw or (audible and (t - float(state._last_phrase_voiced_t)) < 0.25)
+        conf = (
+            float(pitch_conf_arr[i])
+            if pitch_conf_arr is not None and i < len(pitch_conf_arr)
+            else state.last_pitch_conf
+        )
+        tr = state.phrase_tracker
+        breath_p = float(probs[i])
+        starting_line = not tr.in_phrase
+        if starting_line and t < tr.cooldown_until_t:
+            voiced = False
+        else:
+            voiced = _frame_voiced_for_phrase(
+                state, f0, conf, t, starting_line=starting_line,
+            )
+
+        if tr.in_phrase:
+            raw_voiced = voiced
+            if not raw_voiced:
+                state.phrase_gap_frames += 1
+                state.phrase_gap_breath_peak = max(
+                    state.phrase_gap_breath_peak, breath_p,
+                )
+            else:
+                state.phrase_gap_frames = 0
+                state.phrase_gap_breath_peak = 0.0
+            # Inhale between lyric lines — never bridge; tracker counts silence + breath.
+            inhale_likely = (
+                breath_p >= PHRASE_BREATH_PEAK_MIN
+                or state.phrase_gap_breath_peak >= PHRASE_BREATH_PEAK_MIN
+            )
+            if not raw_voiced and not inhale_likely:
+                # Note hop: brief unvoiced dip between notes on the same line.
+                if state.phrase_gap_frames <= PHRASE_NOTE_HOP_MAX_FRAMES:
+                    voiced = True
+                # NanoPitch conf dropout right after a sung frame (not a lyric breath).
+                elif (
+                    state.phrase_gap_frames <= PHRASE_DECODE_BRIDGE_MAX_FRAMES
+                    and breath_p < 0.42
+                ):
+                    voiced = True
+        elif (
+            not voiced
+            and starting_line
+            and f0 > 0
+            and conf >= LIVE_PHRASE_CONF_MIN
+            and state.last_dbfs >= LIVE_AUDIBLE_DBFS
+        ):
+            voiced = True
+
         last_info = state.phrase_tracker.update(
-            float(probs[i]),
+            breath_p,
             voiced,
             t,
             scored=is_scored_gesture(g),
@@ -421,26 +511,40 @@ def _track_phrases(
         )
         phrase_ids.append(last_info["phrase_id"])
         boundary = last_info.get("phrase_boundary")
-        if boundary in ("start", "end"):
-            ev_out: dict = {
-                "event": boundary,
-                "phrase_id": last_info.get("phrase_id", 0),
-                "t": round(t, 3),
-                "samples": int(round(t * SR)),
-                "feedback": last_info.get("phrase_feedback"),
-            }
+        if boundary in ("start", "end") and state.last_dbfs >= LIVE_AUDIBLE_DBFS:
             m = state.phrase_tracker.metrics
             if boundary == "start":
-                ev_out["vocal_start_t"] = round(m.start_t, 3)
-                ev_out["vocal_start_samples"] = int(round(m.start_t * SR))
+                mark_t = round(m.start_t, 3)
+                mark_s = int(round(m.start_t * SR))
+                ev_out = {
+                    "event": "start",
+                    "phrase_id": last_info.get("phrase_id", 0),
+                    "t": mark_t,
+                    "samples": mark_s,
+                    "phrase_start_t": mark_t,
+                    "vocal_start_t": mark_t,
+                    "vocal_start_samples": mark_s,
+                    "feedback": None,
+                }
             else:
-                ev_out["vocal_end_t"] = round(m.end_t, 3)
-                ev_out["vocal_end_samples"] = int(round(m.end_t * SR))
-                ev_out["phrase_start_t"] = round(
-                    float(last_info.get("phrase_start_t", m.start_t)), 3,
+                mark_t = round(m.end_t, 3)
+                mark_s = int(round(m.end_t * SR))
+                p_start = round(
+                    float(last_info.get("phrase_start_t", state.phrase_tracker.phrase_start_t)),
+                    3,
                 )
-                ev_out["vocal_start_t"] = round(m.start_t, 3)
-                ev_out["vocal_start_samples"] = int(round(m.start_t * SR))
+                ev_out = {
+                    "event": "end",
+                    "phrase_id": last_info.get("phrase_id", 0),
+                    "t": mark_t,
+                    "samples": mark_s,
+                    "phrase_start_t": p_start,
+                    "vocal_start_t": p_start,
+                    "vocal_start_samples": int(round(p_start * SR)),
+                    "vocal_end_t": mark_t,
+                    "vocal_end_samples": mark_s,
+                    "feedback": last_info.get("phrase_feedback"),
+                }
             boundary_events.append(ev_out)
 
     return phrase_ids, last_info, boundary_events
@@ -468,8 +572,10 @@ def _extract(state: ClientState, chunk: np.ndarray,
 
     # ── Pitch — streaming NanoPitch + gesture-aware Viterbi ─────────
     f0_arr = np.zeros(0, dtype=np.float32)
+    f0_phrase = np.zeros(0, dtype=np.float32)
     gesture_arr = np.zeros(0, dtype=np.int8)
     frame_indices: list[int] = []
+    pitch_conf_arr = np.zeros(0, dtype=np.float32)
 
     if state.samples_rx >= MIN_AUDIO_SAMPS and _extractor is not None:
         try:
@@ -520,6 +626,8 @@ def _extract(state: ClientState, chunk: np.ndarray,
 
             if posteriors:
                 post = np.stack(posteriors)
+                pitch_conf_arr = np.max(post, axis=-1).astype(np.float32)
+                state.last_pitch_conf = float(pitch_conf_arr[-1])
 
                 # Gesture from raw argmax f0 (pre-Viterbi) — keeps vibrato modulation.
                 prov = provisional_f0_from_posteriors(post)
@@ -564,6 +672,10 @@ def _extract(state: ClientState, chunk: np.ndarray,
                     if frame_n <= NC_CONV_CONTEXT:
                         f0_raw[i] = 0.0
                 f0_arr = f0_raw.astype(np.float32)
+                f0_phrase = f0_arr.copy()
+                for i in range(min(len(f0_arr), len(pitch_conf_arr))):
+                    if f0_arr[i] > 0 and pitch_conf_arr[i] < LIVE_PITCH_CONF_MIN:
+                        f0_arr[i] = 0.0
 
                 # Keep gesture labels from raw-track heuristics (+ model), not Viterbi f0.
                 gesture_arr = gest_arr.astype(np.int8)
@@ -594,8 +706,15 @@ def _extract(state: ClientState, chunk: np.ndarray,
             traceback.print_exc()
 
     n_new = len(f0_arr) if len(f0_arr) else max(1, len(chunk) // HOP_LENGTH)
+    if len(pitch_conf_arr) != n_new and len(pitch_conf_arr) > 0:
+        pitch_conf_arr = np.resize(pitch_conf_arr, n_new)
+    elif len(pitch_conf_arr) == 0:
+        pitch_conf_arr = np.zeros(n_new, dtype=np.float32)
+
     if len(f0_arr) == 0:
         f0_arr = np.zeros(n_new, dtype=np.float32)
+    if len(f0_phrase) != len(f0_arr):
+        f0_phrase = f0_arr.copy()
     if len(gesture_arr) == 0:
         gesture_arr = np.full(n_new, GESTURE_STEADY, dtype=np.int8)
     elif len(gesture_arr) != n_new:
@@ -616,7 +735,7 @@ def _extract(state: ClientState, chunk: np.ndarray,
     # ── CPP + tilt (every CPP_EVERY chunks; gate on audible voicing)
     if state.chunk_n % CPP_EVERY == 0 and state.samples_rx >= 4096:
         voiced_count = int((f0_roll > 0).sum())
-        audible = state.last_dbfs > -55.0
+        audible = state.last_dbfs >= LIVE_AUDIBLE_DBFS
         cpp_len = max(len(chunk) * CPP_EVERY, 1600)
         cpp_buf = buf[-cpp_len:].copy()
         if audible and voiced_count >= 20:
@@ -666,6 +785,10 @@ def _extract(state: ClientState, chunk: np.ndarray,
         ).astype(np.int8)
         gesture_arr = coalesce_glissando_labels(gesture_arr).astype(np.int8)
 
+    # Never emit transition in live path (keeps pitch scoring / chart continuous).
+    if len(gesture_arr):
+        gesture_arr[gesture_arr == GESTURE_TRANSITION] = GESTURE_STEADY
+
     for g in gesture_arr:
         state.gesture_history.append(int(g))
 
@@ -704,8 +827,9 @@ def _extract(state: ClientState, chunk: np.ndarray,
 
     # Phrase scoring uses final gestures + central-relative pitch drift.
     phrase_ids, state.phrase_info, phrase_boundary_events = _track_phrases(
-        state, buf, frame_indices, f0_arr, gesture_arr, hop_s,
+        state, buf, frame_indices, f0_phrase, gesture_arr, hop_s,
         central_arr=central_latest,
+        pitch_conf_arr=pitch_conf_arr,
     )
     if len(phrase_ids) < n_new:
         phrase_ids = phrase_ids + [0] * (n_new - len(phrase_ids))
@@ -739,6 +863,15 @@ def _extract(state: ClientState, chunk: np.ndarray,
         and (state.last_has_vibrato or periodic_now)
     )
     _, et_note, et_dev = _hz_to_et(f0_now)
+    state.vocal_active = bool(
+        state.last_dbfs >= LIVE_AUDIBLE_DBFS
+        and state.last_dynamic != "silent"
+        and f0_now > 0
+        and state.last_pitch_conf >= LIVE_PITCH_CONF_MIN
+    )
+    if not state.vocal_active:
+        et_note = "—"
+        et_dev = 0.0
 
     # ── Build per-frame list ───────────────────────────────────────
     frames = []
@@ -792,24 +925,35 @@ def _extract(state: ClientState, chunk: np.ndarray,
 
     phrase_event = phrase_events_batch[-1] if phrase_events_batch else None
     if phrase_event is None and boundary in ("start", "end"):
-        _t = (
-            pi.get("phrase_start_t", 0.0) if boundary == "start"
-            else state.elapsed
-        )
-        phrase_event = {
-            "event": boundary,
-            "phrase_id": pi.get("phrase_id", 0),
-            "t": round(_t, 3),
-            "samples": int(round(float(_t) * SR)),
-            "feedback": pf if boundary == "end" else None,
-        }
         m = state.phrase_tracker.metrics
         if boundary == "start":
-            phrase_event["vocal_start_t"] = round(m.start_t, 3)
-            phrase_event["vocal_start_samples"] = int(round(m.start_t * SR))
-        elif boundary == "end":
-            phrase_event["vocal_end_t"] = round(m.end_t, 3)
-            phrase_event["vocal_end_samples"] = int(round(m.end_t * SR))
+            _t = round(m.start_t, 3)
+            phrase_event = {
+                "event": "start",
+                "phrase_id": pi.get("phrase_id", 0),
+                "t": _t,
+                "samples": int(round(_t * SR)),
+                "phrase_start_t": _t,
+                "vocal_start_t": _t,
+                "vocal_start_samples": int(round(_t * SR)),
+                "feedback": None,
+            }
+        else:
+            _t = round(m.end_t, 3)
+            p_start = round(state.phrase_tracker.phrase_start_t, 3)
+            phrase_event = {
+                "event": "end",
+                "phrase_id": pi.get("phrase_id", 0),
+                "t": _t,
+                "samples": int(round(_t * SR)),
+                "phrase_start_t": p_start,
+                "vocal_start_t": p_start,
+                "vocal_start_samples": int(round(p_start * SR)),
+                "vocal_end_t": _t,
+                "vocal_end_samples": int(round(_t * SR)),
+                "feedback": pf,
+            }
+        phrase_events_batch.append(phrase_event)
         state.phrase_boundaries.append(phrase_event)
 
     return {
@@ -839,8 +983,11 @@ def _extract(state: ClientState, chunk: np.ndarray,
             "in_phrase":        pi.get("in_phrase", False),
             "pending_phrase":   pi.get("pending_phrase", False),
             "phrase_singing":   bool(
-                pi.get("in_phrase") or pi.get("pending_phrase")
-            ) and state.phrase_tracker.phrase_voiced_frames > 0,
+                state.vocal_active
+                and (pi.get("in_phrase") or pi.get("pending_phrase"))
+                and state.phrase_tracker.phrase_voiced_frames > 0,
+            ),
+            "vocal_active":     state.vocal_active,
             "phrase_feedback":  pf,
             "phrase_boundaries": state.phrase_boundaries[-30:],
         },
@@ -855,7 +1002,7 @@ async def ws_endpoint(ws: WebSocket) -> None:
     state   = ClientState()
     # Process every chunk in order — dropping desyncs GRU/Viterbi from real time.
     q: asyncio.Queue = asyncio.Queue()
-    _MAX_COALESCE = 12   # up to ~120 ms per inference when catching up
+    _MAX_COALESCE = 5    # smaller batches → lower chart/coaching latency
     _BACKLOG_WARN = 50   # log if we fall >500 ms behind
     _backlog_warned = False
 
@@ -940,6 +1087,42 @@ async def ws_endpoint(ws: WebSocket) -> None:
             except Exception as e:
                 print(f"  Error: {e}")
             if eof:
+                flush = state.phrase_tracker.force_end(
+                    state.elapsed,
+                    vib_rate_hz=state.last_vib_rate_hz,
+                    vib_depth_cents=state.last_vib_depth_cents,
+                    vib_consistency=state.last_vib_consistency,
+                )
+                if flush is not None:
+                    m = state.phrase_tracker.metrics
+                    mark_t = round(m.end_t, 3)
+                    p_start = round(state.phrase_tracker.phrase_start_t, 3)
+                    ev = {
+                        "event": "end",
+                        "phrase_id": flush.get("phrase_id", 0),
+                        "t": mark_t,
+                        "samples": int(round(mark_t * SR)),
+                        "phrase_start_t": p_start,
+                        "vocal_start_t": p_start,
+                        "vocal_start_samples": int(round(p_start * SR)),
+                        "vocal_end_t": mark_t,
+                        "vocal_end_samples": int(round(mark_t * SR)),
+                        "feedback": flush.get("phrase_feedback"),
+                    }
+                    try:
+                        await ws.send_text(json.dumps({
+                            "frames": [],
+                            "phrase_events": [ev],
+                            "phrase_event": ev,
+                            "summary": {
+                                "phrase_boundary": "end",
+                                "phrase_id": ev["phrase_id"],
+                                "phrase_feedback": ev.get("feedback"),
+                                "vocal_active": False,
+                            },
+                        }))
+                    except (WebSocketDisconnect, RuntimeError):
+                        pass
                 break
 
     recv = asyncio.create_task(_recv_task())
@@ -1047,8 +1230,11 @@ def _phrase_ranges_from_events(
             return
         end_t = float(end_ev.get("t", 0.0) or 0.0)
         boundary_ts = float(
-            (start_ev or {}).get("t")
+            (start_ev or {}).get("vocal_start_t")
+            or (start_ev or {}).get("phrase_start_t")
+            or (start_ev or {}).get("t")
             or end_ev.get("phrase_start_t")
+            or end_ev.get("vocal_start_t")
             or end_ev.get("boundary_start_t")
             or 0.0,
         )
@@ -1097,7 +1283,12 @@ def _phrase_ranges_from_events(
     for pid, start_ev in sorted(starts.items()):
         if pid in seen:
             continue
-        start_t = float(start_ev.get("t", 0.0) or 0.0)
+        start_t = float(
+            start_ev.get("vocal_start_t")
+            or start_ev.get("phrase_start_t")
+            or start_ev.get("t", 0.0)
+            or 0.0,
+        )
         if session_end_t - start_t < MIN_PHRASE_S * 0.75:
             continue
         _append(pid, start_ev, {
@@ -1105,7 +1296,7 @@ def _phrase_ranges_from_events(
             "vocal_end_t": session_end_t,
             "vocal_end_samples": int(round(session_end_t * SR)),
             "phrase_start_t": start_t,
-            "vocal_start_t": start_ev.get("vocal_start_t"),
+            "vocal_start_t": start_t,
             "vocal_start_samples": start_ev.get("vocal_start_samples"),
         })
 
@@ -1216,7 +1407,7 @@ def _run_analysis(frames: list[dict], summaries: list[dict], phrase_events: list
         ],
         dtype=np.float32,
     )
-    # scored = steady only; gliss/transition use slide-control in combined_pitch_score
+    # scored = steady only; glissando uses slide-control in combined_pitch_score
     scored  = np.array([bool(f.get("scored", True)) for f in frames], dtype=bool)
     gestures = np.array(
         [gesture_index(str(f.get("gesture", "steady"))) for f in frames],

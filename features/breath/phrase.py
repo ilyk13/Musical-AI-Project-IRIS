@@ -15,11 +15,17 @@ from features.pitch.gesture import (
 )
 
 BREATH_WINDOW = 480
-BREATH_THRESHOLD = 0.6
-MIN_BREATH_FRAMES = 6      # 60 ms sustained breath prob (less eager to end)
-MIN_SILENCE_FRAMES = 45    # 450 ms unvoiced gap ends a confirmed phrase
-MIN_SILENCE_ABORT = 45     # 450 ms silence cancels an unconfirmed voice blip
-MIN_PHRASE_FRAMES = 45     # 450 ms voiced before a phrase is confirmed
+BREATH_THRESHOLD = 0.52
+MIN_BREATH_FRAMES = 6        # 60 ms confident inhale
+MIN_SILENCE_FRAMES = 40      # 400 ms true silence ends a line
+MIN_SILENCE_BREATH_GAP = 12  # 120 ms pause + inhale (fast tempo between lyrics)
+MIN_GAP_BREATH_PEAK = 0.38   # peak breath prob during that pause
+MIN_SILENCE_STRONG_BREATH = 8   # 80 ms when inhale prob is already high
+MIN_STRONG_GAP_BREATH_PEAK = 0.48
+MIN_SILENCE_ABORT = 65       # 650 ms silence cancels spurious pending
+MIN_PHRASE_FRAMES = 42       # 420 ms sung before start marker
+MIN_PHRASE_END_FRAMES = 30   # min sung frames before a line can close
+MIN_PHRASE_COOLDOWN_S = 0.38 # ignore note-hop blips right after a line ends
 MIN_PITCH_FRAMES = 3       # need ≥3 steady frames to judge pitch (matches /analyze)
 
 
@@ -316,6 +322,8 @@ class PhraseTracker:
         self.silence_run = 0
         self.phrase_voiced_frames = 0
         self.last_breath_prob = 0.0
+        self.cooldown_until_t = 0.0
+        self.gap_breath_peak = 0.0
         self.metrics = LivePhraseMetrics()
         self.last_feedback: dict | None = None
 
@@ -332,6 +340,31 @@ class PhraseTracker:
         self.phrase_id += 1
         self.phrase_start_t = self.metrics.start_t
         return "start"
+
+    def force_end(
+        self,
+        t: float,
+        *,
+        vib_rate_hz: float = float("nan"),
+        vib_depth_cents: float = float("nan"),
+        vib_consistency: float = 0.0,
+    ) -> dict | None:
+        """Close an open phrase at session end (so the chart gets an end marker)."""
+        if not self.in_phrase or self.phrase_voiced_frames < MIN_PHRASE_END_FRAMES:
+            return None
+        self.metrics.end_t = max(self.metrics.end_t, t)
+        completed = self.phrase_id
+        feedback = self.metrics.finish(
+            completed, vib_rate_hz, vib_depth_cents, vib_consistency,
+        )
+        self.last_feedback = feedback
+        self.in_phrase = False
+        self.pending_phrase = False
+        self.breath_run = 0
+        self.phrase_voiced_frames = 0
+        snap = self.snapshot("end", completed_id=completed)
+        snap["phrase_feedback"] = feedback
+        return snap
 
     def update(
         self,
@@ -359,27 +392,29 @@ class PhraseTracker:
 
         if voiced:
             self.silence_run = 0
+            self.gap_breath_peak = 0.0
             if not self.in_phrase:
-                if not self.pending_phrase:
-                    self.pending_phrase = True
-                    self.phrase_voiced_frames = 0
-                    self.metrics.reset()
-                    self.metrics.start_t = t
-                self.phrase_voiced_frames += 1
-                self.metrics.add_frame(
-                    t,
-                    voiced=True,
-                    scored=scored,
-                    et_dev_cents=et_dev_cents,
-                    gesture=gesture,
-                    cpp=cpp,
-                    f0_hz=f0_hz,
-                )
-                if (
-                    self.pending_phrase
-                    and self.phrase_voiced_frames >= MIN_PHRASE_FRAMES
-                ):
-                    boundary = self._confirm_phrase()
+                if t >= self.cooldown_until_t:
+                    if not self.pending_phrase:
+                        self.pending_phrase = True
+                        self.phrase_voiced_frames = 0
+                        self.metrics.reset()
+                        self.metrics.start_t = t
+                    self.phrase_voiced_frames += 1
+                    self.metrics.add_frame(
+                        t,
+                        voiced=True,
+                        scored=scored,
+                        et_dev_cents=et_dev_cents,
+                        gesture=gesture,
+                        cpp=cpp,
+                        f0_hz=f0_hz,
+                    )
+                    if (
+                        self.pending_phrase
+                        and self.phrase_voiced_frames >= MIN_PHRASE_FRAMES
+                    ):
+                        boundary = self._confirm_phrase()
             else:
                 self.phrase_voiced_frames += 1
                 self.metrics.add_frame(
@@ -393,14 +428,29 @@ class PhraseTracker:
                 )
         else:
             self.silence_run += 1
+            if self.in_phrase and breath_prob >= MIN_GAP_BREATH_PEAK:
+                self.gap_breath_peak = max(self.gap_breath_peak, float(breath_prob))
             if self.pending_phrase and not self.in_phrase:
                 if self.silence_run >= MIN_SILENCE_ABORT:
                     self._abort_pending()
-            elif self.in_phrase and self.phrase_voiced_frames >= MIN_PHRASE_FRAMES:
-                if (
+            elif (
+                self.in_phrase
+                and self.phrase_voiced_frames >= MIN_PHRASE_END_FRAMES
+            ):
+                # Line break: inhale, long silence, or short pause + breath (fast lyrics).
+                line_break = (
                     self.breath_run >= MIN_BREATH_FRAMES
                     or self.silence_run >= MIN_SILENCE_FRAMES
-                ):
+                    or (
+                        self.silence_run >= MIN_SILENCE_BREATH_GAP
+                        and self.gap_breath_peak >= MIN_GAP_BREATH_PEAK
+                    )
+                    or (
+                        self.silence_run >= MIN_SILENCE_STRONG_BREATH
+                        and self.gap_breath_peak >= MIN_STRONG_GAP_BREATH_PEAK
+                    )
+                )
+                if line_break:
                     completed = self.phrase_id
                     feedback = self.metrics.finish(
                         completed, vib_rate_hz, vib_depth_cents, vib_consistency,
@@ -410,6 +460,7 @@ class PhraseTracker:
                     self.pending_phrase = False
                     self.breath_run = 0
                     self.phrase_voiced_frames = 0
+                    self.cooldown_until_t = t + MIN_PHRASE_COOLDOWN_S
                     snap = self.snapshot("end", completed_id=completed)
                     snap["phrase_feedback"] = feedback
                     return snap

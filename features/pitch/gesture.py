@@ -17,9 +17,9 @@ GESTURE_VIBRATO = 1
 GESTURE_GLISSANDO = 2
 GESTURE_TRANSITION = 3
 
-# Steady frames: equal-temperament accuracy. Gliss/transition: slide-control penalty only.
+# Steady frames: equal-temperament accuracy. Glissando: slide-control penalty only.
 SCORED_GESTURES = frozenset({GESTURE_STEADY})
-SLIDE_GESTURES = frozenset({GESTURE_GLISSANDO, GESTURE_TRANSITION})
+SLIDE_GESTURES = frozenset({GESTURE_GLISSANDO})
 
 
 def gesture_name(idx: int) -> str:
@@ -91,18 +91,99 @@ def detect_vibrato_frames(
     return (energy > max(thr, depth_thr)) & voiced
 
 
-def detect_transition_frames(f0: np.ndarray, jump_cents: float = 110.0) -> np.ndarray:
-    """Wide regions around rapid pitch jumps (note changes / scoops)."""
+def detect_transition_frames(
+    f0: np.ndarray,
+    jump_cents: float = 110.0,
+    *,
+    pad_before: int = 2,
+    pad_after: int = 3,
+    lookback_frames: int = 1,
+) -> np.ndarray:
+    """Wide regions around rapid pitch jumps (note changes / scoops).
+
+    lookback_frames > 1 catches jumps spread across several 10 ms frames
+    (common with streaming argmax f0).
+    """
     n = len(f0)
     mask = np.zeros(n, dtype=bool)
+    lb = max(1, int(lookback_frames))
     for t in range(1, n):
-        if f0[t] <= 0 or f0[t - 1] <= 0:
+        if f0[t] <= 0:
             continue
-        jump = abs(1200.0 * np.log2(f0[t] / (f0[t - 1] + 1e-10) + 1e-10))
-        if jump >= jump_cents:
-            lo = max(0, t - 2)
-            hi = min(n, t + 3)
+        best_jump = 0.0
+        for dt in range(1, min(lb + 1, t + 1)):
+            if f0[t - dt] <= 0:
+                continue
+            jump = abs(
+                1200.0 * np.log2(f0[t] / (f0[t - dt] + 1e-10) + 1e-10),
+            )
+            best_jump = max(best_jump, jump)
+        if best_jump >= jump_cents:
+            lo = max(0, t - pad_before)
+            hi = min(n, t + pad_after)
             mask[lo:hi] = True
+    return mask
+
+
+def detect_transition_frames_live(
+    f0: np.ndarray,
+    *,
+    min_net_cents: float = 95.0,
+    min_step_cents: float = 72.0,
+    strong_step_cents: float = 135.0,
+    baseline_frames: int = 22,
+    confirm_frames: int = 3,
+    confirm_tol_cents: float = 38.0,
+    pad_before: int = 2,
+    pad_after: int = 4,
+) -> np.ndarray:
+    """Conservative note-change detector for mic/streaming f0.
+
+    Uses median baseline + landing confirmation so vibrato wobble and
+    single-frame pitch spikes on a held note do not fire.
+    """
+    n = len(f0)
+    mask = np.zeros(n, dtype=bool)
+    if n < 8:
+        return mask
+
+    for t in range(1, n):
+        if f0[t] <= 0:
+            continue
+        step = 0.0
+        if f0[t - 1] > 0:
+            step = abs(1200.0 * np.log2(f0[t] / (f0[t - 1] + 1e-10) + 1e-10))
+
+        lo = max(0, t - baseline_frames)
+        prior = f0[lo:max(lo, t - 3)]
+        prior = prior[prior > 0]
+        net = 0.0
+        if len(prior) >= 6:
+            baseline = float(np.median(prior))
+            net = abs(1200.0 * np.log2(f0[t] / (baseline + 1e-10) + 1e-10))
+
+        strong = step >= strong_step_cents
+        moderate = net >= min_net_cents and step >= min_step_cents
+        if not strong and not moderate:
+            continue
+
+        if not strong:
+            hi = min(n, t + 1 + confirm_frames)
+            future = f0[t + 1:hi]
+            future = future[future > 0]
+            if len(future) < 2:
+                continue
+            ref = float(f0[t])
+            landed = all(
+                abs(1200.0 * np.log2(fv / (ref + 1e-10) + 1e-10)) <= confirm_tol_cents
+                for fv in future
+            )
+            if not landed:
+                continue
+
+        p_lo = max(0, t - pad_before)
+        p_hi = min(n, t + pad_after)
+        mask[p_lo:p_hi] = True
     return mask
 
 
@@ -429,7 +510,8 @@ def classify_gestures_live(
     """
     f0 = np.asarray(f0, dtype=np.float64)
     n = len(f0)
-    jump_t = detect_transition_frames(f0)
+    # Live coaching prioritises pitch accuracy — no transition labels (note jumps → steady).
+    jump_t = np.zeros(n, dtype=bool)
     vibrato = detect_vibrato_frames(f0.astype(np.float32), **_LIVE_VIBRATO)
     vib_block = detect_vibrato_frames(f0.astype(np.float32), **_LIVE_GLISS_VIB_BLOCK)
     # Slides often coincide with pitch jumps and flat posteriors — detect
@@ -440,15 +522,8 @@ def classify_gestures_live(
     )
     glissando |= detect_glissando_net_ramp(f0, vibrato_mask=vib_excl, **_LIVE_GLISS_NET)
 
+    # Confirmed f0 jumps win over vibrato/glissando heuristics on those frames.
     transition = jump_t.copy()
-    if posteriorgram is not None and len(posteriorgram) > 0:
-        post_arr = np.asarray(posteriorgram, dtype=np.float32)
-        k = min(len(post_arr), n)
-        entropy = pitch_posterior_entropy(post_arr[:k])
-        voiced_tail = f0[n - k:] > 0
-        transition[n - k:] |= (entropy > entropy_threshold) & voiced_tail
-
-    transition &= ~glissando & ~vibrato
 
     labels = np.full(n, GESTURE_STEADY, dtype=np.int8)
     labels[glissando & ~transition & ~vibrato] = GESTURE_GLISSANDO
@@ -717,9 +792,7 @@ def smooth_gesture_label(
         n_trans = int(np.sum(recent == GESTURE_TRANSITION))
         if n_vib >= max(9, int(win * 0.16)):
             return GESTURE_VIBRATO
-        if n_trans >= max(4, int(win * 0.10)):
-            return GESTURE_TRANSITION
-        # Glissando omitted from live readout — coaching prioritises steady / vibrato / transition.
+        # Glissando omitted from live readout — coaching prioritises steady / vibrato.
 
     if len(recent) == 0:
         return GESTURE_STEADY

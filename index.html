@@ -774,10 +774,10 @@
 
   // ── Constants ─────────────────────────────────────────────────────
   const PITCH_WIN        = 30;     // seconds shown in live chart
-  const CHART_HOLD_MS    = 2500;   // hold last f0 through short silences / decode gaps
-  const VOICED_HOLD_MS   = 2500;   // coaching cards + sidebar hold
-  const SIDEBAR_MS       = 250;    // min interval between sidebar DOM updates
-  const CHART_MS         = 100;    // min interval between chart redraws
+  const CHART_HOLD_MS    = 350;    // chart only: brief gap fill (not coaching hold)
+  const VOICED_HOLD_MS   = 1600;   // coaching cards + sidebar after last real singing
+  const SIDEBAR_MS       = 200;    // min interval between sidebar DOM updates
+  const CHART_MS         = 40;     // min interval between chart redraws
   const DEV_SMOOTH       = 0.35;   // EMA weight for new cents reading (lower = smoother)
 
   // ── Live state ────────────────────────────────────────────────────
@@ -814,6 +814,7 @@
   let _lastPhraseFeedback = null;
   let livePhraseBoundaries = [];
   let allPhraseEvents = [];
+  const _phraseEventKeys = new Set();
   let phraseReplayById = {};  // phrase_id → { startSample, endSample, startT, endT }
 
   // ── Utilities ─────────────────────────────────────────────────────
@@ -856,7 +857,7 @@
   function segmentColor(ctx) {
     const raw = ctx.p1.raw;
     if (!raw || !raw.voiced) return 'transparent';
-    if (raw.scored === false) return '#7eb8f738'; // transition / glissando
+    if (raw.scored === false) return '#7eb8f738'; // glissando (unscored for ET)
     const dev = raw.etDev;
     if (dev === null || dev === undefined) return '#7eb8f7';
     const abs = Math.abs(dev);
@@ -886,7 +887,8 @@
           ctx.stroke();
           ctx.fillStyle = '#7eb8f7cc';
           ctx.font = `9px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif`;
-          ctx.fillText('phrase', xPos + 3, chartArea.top + 10);
+          const lbl = ev.phrase_id ? `P${ev.phrase_id}` : 'phrase';
+          ctx.fillText(lbl, xPos + 3, chartArea.top + 10);
         } else if (ev.event === 'end') {
           ctx.strokeStyle = '#55efc444';
           ctx.lineWidth = 1;
@@ -991,7 +993,8 @@
     const needle   = document.getElementById('tunerNeedle');
     const vibLegend = document.getElementById('vibSineLegend');
     const isVib    = voiced && _isVibratoSignal(s);
-    const isGliss  = voiced && !isVib && _activeGesture(s) === 'glissando';
+    const ag = voiced ? _activeGesture(s) : 'steady';
+    const isGliss = ag === 'glissando';
 
     noteEl.textContent = voiced ? s.et_note : '—';
     noteEl.className   = 'note-display' + (isVib ? ' vibrato-mode' : '');
@@ -1060,7 +1063,7 @@
   function updatePhraseBlock(s, voiced) {
     const main = document.getElementById('phraseVal');
     const sub  = document.getElementById('phraseSub');
-    const singing = !!(voiced || s.phrase_singing);
+    const singing = !!(voiced && (s.phrase_singing || s.in_phrase));
 
     if (s.in_phrase && s.phrase_id > 0 && singing) {
       main.textContent = 'In phrase';
@@ -1145,13 +1148,32 @@
     return events;
   }
 
-  function _onPhraseEvent(ev) {
-    if (!ev || !ev.event) return;
+  function _phraseMarkerT(ev) {
+    if (!ev) return 0;
+    if (ev.event === 'start') {
+      return ev.vocal_start_t ?? ev.phrase_start_t ?? ev.t ?? 0;
+    }
+    if (ev.event === 'end') {
+      return ev.vocal_end_t ?? ev.t ?? 0;
+    }
+    return ev.t ?? 0;
+  }
+
+  function _phraseEventKey(ev) {
+    const mt = _phraseMarkerT(ev);
+    return `${ev.event}|${ev.phrase_id}|${mt.toFixed(3)}`;
+  }
+
+  function _ingestPhraseBoundary(ev) {
+    if (!ev || !ev.event || !ev.phrase_id) return;
+    const key = _phraseEventKey(ev);
+    if (_phraseEventKeys.has(key)) return;
+    _phraseEventKeys.add(key);
     allPhraseEvents.push({
       event: ev.event,
       phrase_id: ev.phrase_id,
       t: ev.t,
-      samples: ev.samples != null ? ev.samples : Math.round((ev.t || 0) * SR16),
+      samples: ev.samples != null ? ev.samples : Math.round((_phraseMarkerT(ev) || 0) * SR16),
       phrase_start_t: ev.phrase_start_t,
       vocal_start_t: ev.vocal_start_t,
       vocal_start_samples: ev.vocal_start_samples,
@@ -1159,13 +1181,29 @@
       vocal_end_samples: ev.vocal_end_samples,
       feedback: ev.event === 'end' ? ev.feedback : null,
     });
-    _rebuildPhraseReplayMap();
-    livePhraseBoundaries.push({ event: ev.event, phrase_id: ev.phrase_id, t: ev.t });
+  }
+
+  function _syncLivePhraseBoundaries() {
     const pMin = latestT - PITCH_WIN;
-    while (livePhraseBoundaries.length && livePhraseBoundaries[0].t < pMin - 1) {
-      livePhraseBoundaries.shift();
+    livePhraseBoundaries.length = 0;
+    for (const ev of allPhraseEvents) {
+      const markT = _phraseMarkerT(ev);
+      if (markT >= pMin - 0.5) {
+        livePhraseBoundaries.push({
+          event: ev.event,
+          phrase_id: ev.phrase_id,
+          t: markT,
+        });
+      }
     }
     _chartDirty = true;
+  }
+
+  function _onPhraseEvent(ev, s) {
+    if (!ev || !ev.event) return;
+    _ingestPhraseBoundary(ev);
+    _rebuildPhraseReplayMap();
+    _syncLivePhraseBoundaries();
 
     if (ev.event === 'start') {
       const sub = document.getElementById('phraseSub');
@@ -1183,9 +1221,9 @@
     }
   }
 
-  function _onPhraseEvents(events) {
+  function _onPhraseEvents(events, s) {
     if (!events || !events.length) return;
-    events.forEach(_onPhraseEvent);
+    events.forEach(ev => _onPhraseEvent(ev, s));
   }
 
   // ── Coaching cards ────────────────────────────────────────────────
@@ -1224,15 +1262,19 @@
   }
 
   function _summaryVoiced(s) {
-    // Require both a valid pitch AND audible energy so we don't treat
-    // "held pitch" through silence as real singing.
-    const hasNote = !!(s && s.et_note && s.et_note !== '—');
-    const audible = !!(s && typeof s.dbfs === 'number' && s.dbfs > -55);
+    if (!s) return false;
+    if (typeof s.vocal_active === 'boolean') return s.vocal_active;
+    const hasNote = !!(s.et_note && s.et_note !== '—');
+    const audible = typeof s.dbfs === 'number' && s.dbfs >= -50;
     return hasNote && audible;
   }
 
   function _displayActive(summaryVoiced) {
     return summaryVoiced || (Date.now() - lastChartVoicedAt < VOICED_HOLD_MS);
+  }
+
+  function _chartActive(summaryVoiced) {
+    return summaryVoiced || (Date.now() - lastChartVoicedAt < CHART_HOLD_MS);
   }
 
   function _updateStickySummary(s) {
@@ -1243,7 +1285,10 @@
       _stickySummary.phrase_singing = s.phrase_singing;
       if (s.phrase_feedback) _stickySummary.phrase_feedback = s.phrase_feedback;
     }
-    if (!_summaryVoiced(s)) return;
+    if (!_summaryVoiced(s)) {
+      _stickySummary = null;
+      return;
+    }
     if (!_stickySummary) {
       _stickySummary = { ...s };
       return;
@@ -1252,10 +1297,8 @@
     _stickySummary.et_dev_cents =
       _stickySummary.et_dev_cents * (1 - DEV_SMOOTH) + s.et_dev_cents * DEV_SMOOTH;
     const now = Date.now();
-    const motion = s.gesture === 'glissando' || s.gesture === 'transition'
-      || s.gesture === 'vibrato'
-      || s.gesture_raw === 'glissando' || s.gesture_raw === 'transition'
-      || s.gesture_raw === 'vibrato'
+    const motion = s.gesture === 'glissando' || s.gesture === 'vibrato'
+      || s.gesture_raw === 'glissando' || s.gesture_raw === 'vibrato'
       || s.glissando_active || s.vibrato_active;
     if (s.gesture === _stickySummary.gesture || now - _lastGestureSticky > 400 || motion) {
       _stickySummary.gesture = s.gesture;
@@ -1315,7 +1358,6 @@
     }
     if (now < _vibStickyUntil) return 'vibrato';
 
-    if (g === 'transition' || r === 'transition') return 'transition';
     if (g === 'vibrato' || r === 'vibrato') return 'vibrato';
     return g;
   }
@@ -1325,7 +1367,7 @@
     const gesture = _activeGesture(s);
     _updatePitchCat(s.et_dev_cents);
 
-    // Gesture — glissando (pitch scoring paused)
+    // Gesture — slide (pitch ET scoring paused on glissando only)
     if (gesture === 'glissando') {
       cards.push({
         type:  'tip',
@@ -1334,8 +1376,8 @@
       });
     }
 
-    // Pitch card (steady / in-tune feedback only when not glissando)
-    if (gesture !== 'glissando' && gesture !== 'transition') {
+    // Pitch accuracy card (hidden during glissando only)
+    if (gesture !== 'glissando') {
       const p = _stablePitchCat;
       if      (p === 'in-tune')    cards.push({ type: 'good', title: 'Great pitch control!',    sub: 'You\'re staying centered.' });
       else if (p === 'flat-bad')   cards.push({ type: 'warn', title: 'Pitch drifting flat',      sub: 'Try supporting more during sustained notes.' });
@@ -1429,15 +1471,14 @@
     if (voiced) _lastVoicedAt = now;
     const show = _sidebarSummary(s, displayActive);
 
-    const silent = !displayActive && (now - _lastVoicedAt) > VOICED_HOLD_MS;
-    if (silent) {
+    const silent = !voiced && (now - _lastVoicedAt) > VOICED_HOLD_MS;
+    if (silent || !displayActive) {
       if (_lastCardSig !== 'silent') {
         _lastCardSig = 'silent';
         _renderCards([]);
       }
       return;
     }
-    if (!displayActive) return;
 
     // Compute categorical signature to detect meaningful changes
     _updatePitchCat(show.et_dev_cents);
@@ -1475,10 +1516,16 @@
 
       const msg = JSON.parse(evt.data);
       const s   = msg.summary;
+      if (s.phrase_boundaries && s.phrase_boundaries.length) {
+        s.phrase_boundaries.forEach(_ingestPhraseBoundary);
+      }
       if (msg.phrase_events && msg.phrase_events.length) {
-        _onPhraseEvents(msg.phrase_events);
+        _onPhraseEvents(msg.phrase_events, s);
       } else if (msg.phrase_event) {
-        _onPhraseEvent(msg.phrase_event);
+        _onPhraseEvent(msg.phrase_event, s);
+      } else if (s.phrase_boundaries && s.phrase_boundaries.length) {
+        _rebuildPhraseReplayMap();
+        _syncLivePhraseBoundaries();
       }
       if (s.phrase_feedback && s.phrase_boundary === 'end') {
         _lastPhraseFeedback = s.phrase_feedback;
@@ -1488,7 +1535,7 @@
       if (summaryVoiced) lastChartVoicedAt = Date.now();
       _updateStickySummary(s);
       const displayActive = _displayActive(summaryVoiced);
-      const chartActive = displayActive;
+      const chartActive = _chartActive(summaryVoiced);
       const sidebar = _sidebarSummary(s, displayActive);
       const sidebarVoiced = _sidebarVoiced(s, displayActive);
 
@@ -1559,6 +1606,7 @@
 
         if (f.t > latestT) latestT = f.t;
       });
+      _syncLivePhraseBoundaries();
 
       // Trim live chart window
       const pMin = latestT - PITCH_WIN;
@@ -1569,7 +1617,11 @@
       pitchChart.options.scales.x.max = Math.max(latestT, PITCH_WIN);
       _chartDirty = true;
       const now = Date.now();
-      if (now - _lastChartUpdate >= CHART_MS) _flushChart();
+      if (now - _lastChartUpdate >= CHART_MS) {
+        _flushChart();
+      } else if (summaryVoiced) {
+        requestAnimationFrame(_flushChart);
+      }
 
       // Sidebar: throttle DOM writes so readouts stay readable while singing
       if (now - _lastSidebarUpdate >= SIDEBAR_MS) {
@@ -2182,6 +2234,7 @@
     _lastGestureSticky = 0; _lastPhraseFeedback = null; _lastLiveCards = [];
     livePhraseBoundaries.length = 0;
     allPhraseEvents.length = 0;
+    _phraseEventKeys.clear();
     phraseReplayById = {};
     _stablePitchCat = 'in-tune'; _lastCardSig = ''; _lastCardUpdate = 0; _lastVoicedAt = 0;
     _lastGestureCat = 'steady';

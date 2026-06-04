@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from features.pitch.gesture import GESTURE_GLISSANDO, GESTURE_TRANSITION
+from features.pitch.gesture import GESTURE_GLISSANDO
 
 
 def _scoring_mask(f0: np.ndarray, scored: np.ndarray) -> np.ndarray:
@@ -75,9 +75,9 @@ def instability_score(step_p85_cents: float) -> float:
 
 
 def slide_wander_cents(f0: np.ndarray, gestures: np.ndarray) -> float:
-    """How choppy gliss/transition motion is (¢ scale) — not ET distance from a note."""
+    """How choppy glissando motion is (¢ scale) — not ET distance from a note."""
     g = gestures.astype(np.int8)
-    slide = (g == GESTURE_GLISSANDO) | (g == GESTURE_TRANSITION)
+    slide = g == GESTURE_GLISSANDO
     idx = np.where(slide & (f0 > 0))[0]
     if len(idx) < 4:
         return 0.0
@@ -114,7 +114,7 @@ def _slide_fraction(f0: np.ndarray, gestures: np.ndarray) -> float:
     n_voiced = int(voiced.sum())
     if n_voiced < 4:
         return 0.0
-    slide = ((g == GESTURE_GLISSANDO) | (g == GESTURE_TRANSITION)) & voiced
+    slide = (g == GESTURE_GLISSANDO) & voiced
     return float(slide.sum()) / float(n_voiced)
 
 
@@ -134,7 +134,7 @@ def combined_pitch_score(
     drift_score: float,
     gestures: np.ndarray | None = None,
 ) -> float:
-    """Typical on-pitch accuracy + bias + drift + slide control on gliss/transition."""
+    """Typical on-pitch accuracy + bias + drift + slide control on glissando."""
     steady = scored & (f0 > 0)
     inst_mask = steady if int(steady.sum()) >= 8 else (f0 > 0)
 
@@ -168,7 +168,7 @@ def phrase_pitch_score_from_deviations(
     deviations_cents: list[float],
     slide_steps: list[float] | None = None,
 ) -> float:
-    """Live phrase end — steady ET accuracy + optional gliss/transition slide control."""
+    """Live phrase end — steady ET accuracy + optional glissando slide control."""
     if len(deviations_cents) < 3:
         return 70.0
     d = np.asarray(deviations_cents, dtype=np.float64)

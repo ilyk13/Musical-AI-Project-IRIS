@@ -1,0 +1,65 @@
+{
+  "heuristic_only": {
+    "macro_f1": 0.3215,
+    "per_class": {
+      "steady": {
+        "precision": 0.8431,
+        "recall": 0.728,
+        "support": 206835
+      },
+      "vibrato": {
+        "precision": 0.8373,
+        "recall": 0.1049,
+        "support": 13593
+      },
+      "glissando": {
+        "precision": 0.1061,
+        "recall": 0.3348,
+        "support": 21998
+      },
+      "transition": {
+        "precision": 0.7792,
+        "recall": 0.0874,
+        "support": 8238
+      }
+    },
+    "steady_to_transition_fp": 163,
+    "steady_support": 206835,
+    "steady_to_transition_rate": 0.0008
+  },
+  "heuristic_plus_tcn_merge": {
+    "macro_f1": 0.3148,
+    "per_class": {
+      "steady": {
+        "precision": 0.8324,
+        "recall": 0.9979,
+        "support": 206835
+      },
+      "vibrato": {
+        "precision": 0.8373,
+        "recall": 0.1049,
+        "support": 13593
+      },
+      "glissando": {
+        "precision": 0.0,
+        "recall": 0.0,
+        "support": 21998
+      },
+      "transition": {
+        "precision": 0.7689,
+        "recall": 0.0925,
+        "support": 8238
+      }
+    },
+    "steady_to_transition_fp": 186,
+    "steady_support": 206835,
+    "steady_to_transition_rate": 0.0009
+  },
+  "merge_kwargs": {
+    "transition_conf_min": 0.86,
+    "transition_prob_min": 0.52,
+    "transition_margin": 0.18,
+    "vibrato_prob_min": 0.74,
+    "model_confidence": 0.55
+  }
+}
