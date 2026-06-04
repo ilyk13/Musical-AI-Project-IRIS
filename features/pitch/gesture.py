@@ -248,6 +248,48 @@ def detect_glissando_net_ramp(
     return mask
 
 
+def demote_glissando_for_coaching(
+    gesture: np.ndarray,
+    f0: np.ndarray,
+    vib_cents: np.ndarray | None = None,
+    *,
+    win: int = 30,
+) -> np.ndarray:
+    """Drop glissando unless a strict net ramp confirms a real slide.
+
+    Coaching does not need high glissando recall; false positives hurt pitch
+    scoring (slide-control penalty) and confuse the UI. Missed glissandi are OK.
+    """
+    out = gesture.copy()
+    n = len(out)
+    if n == 0:
+        return out
+    vib_m = (out == GESTURE_VIBRATO)
+    confirmed = detect_glissando_net_ramp(
+        f0, vibrato_mask=vib_m, **_STRICT_GLISS_CONFIRM,
+    )
+    for i in range(n):
+        if out[i] != GESTURE_GLISSANDO:
+            continue
+        if vib_cents is not None and i < len(vib_cents) and f0[i] > 0:
+            lo = max(0, i - win + 1)
+            seg = vib_cents[lo:i + 1]
+            if segment_has_vibrato_period(seg, **VIB_PERIOD_LIVE):
+                out[i] = GESTURE_VIBRATO
+                continue
+        if not confirmed[i]:
+            out[i] = GESTURE_STEADY
+    return enforce_min_duration(
+        out,
+        {
+            GESTURE_VIBRATO: _MIN_DURATION_FRAMES[GESTURE_VIBRATO],
+            GESTURE_TRANSITION: _MIN_DURATION_FRAMES[GESTURE_TRANSITION],
+            GESTURE_GLISSANDO: _GLISS_MIN_RUN_COACHING,
+            GESTURE_STEADY: _MIN_DURATION_FRAMES[GESTURE_STEADY],
+        },
+    )
+
+
 def boost_glissando_labels(
     labels: np.ndarray,
     f0: np.ndarray,
@@ -316,6 +358,10 @@ _LIVE_GLISS = dict(
     min_slope_cents=3.5, min_run=10, min_total_cents=55.0, validate_monotonic=True,
 )
 _LIVE_GLISS_NET = dict(win=35, min_net_cents=55.0, min_directedness=0.62)
+
+# Coaching: only keep glissando when a sustained, directed slide is obvious.
+_STRICT_GLISS_CONFIRM = dict(win=28, min_net_cents=72.0, min_directedness=0.70)
+_GLISS_MIN_RUN_COACHING = 22  # 220 ms at 10 ms/frame
 
 # Offline training labels — vibrato before glissando; tighter glissando gate.
 _TRAIN_VIBRATO = dict(percentile=62.0, depth_thr=0.010)
@@ -477,19 +523,37 @@ def provisional_f0_from_posteriors(posteriorgram: np.ndarray) -> np.ndarray:
     return f0
 
 
+def _transition_merge_ok(
+    probs_i: np.ndarray,
+    *,
+    transition_conf_min: float,
+    transition_prob_min: float,
+    transition_margin: float,
+) -> bool:
+    """TCN transition promotion — high bar to avoid steady→transition FPs."""
+    trans_p = float(probs_i[GESTURE_TRANSITION])
+    steady_p = float(probs_i[GESTURE_STEADY])
+    if trans_p < transition_conf_min or trans_p < transition_prob_min:
+        return False
+    if trans_p < steady_p + transition_margin:
+        return False
+    return True
+
+
 def merge_gesture_predictions(
     heuristic: np.ndarray,
     model_logits: np.ndarray | None,
     model_confidence: float = 0.40,
     vibrato_prob_min: float = 0.72,
-    transition_conf_min: float = 0.70,
+    transition_conf_min: float = 0.84,
+    transition_prob_min: float = 0.52,
+    transition_margin: float = 0.18,
     steady_vibrato_override: float = 0.78,
 ) -> np.ndarray:
     """Blend model logits with f0 heuristics — heuristics win for motion classes.
 
-    v3 val vibrato precision ~27%%; model may only override steady when very
-    confident. Glissando/transition from heuristics are preserved unless the
-    model strongly predicts transition.
+    Transition from the model requires high probability *and* a clear margin
+    over steady (demo-tuned for GestureTCN 3-class precision).
     """
     if model_logits is None or len(model_logits) == 0:
         return heuristic
@@ -504,33 +568,39 @@ def merge_gesture_predictions(
     for i in range(len(out)):
         h, m, c = int(heuristic[i]), int(pred[i]), float(conf[i])
         vib_p = float(probs[i, GESTURE_VIBRATO])
-        trans_p = float(probs[i, GESTURE_TRANSITION])
-        gliss_p = float(probs[i, GESTURE_GLISSANDO])
+        trans_ok = _transition_merge_ok(
+            probs[i],
+            transition_conf_min=transition_conf_min,
+            transition_prob_min=transition_prob_min,
+            transition_margin=transition_margin,
+        )
 
         if h == GESTURE_TRANSITION:
             out[i] = GESTURE_TRANSITION
         elif h == GESTURE_GLISSANDO:
-            if m == GESTURE_TRANSITION and trans_p >= transition_conf_min:
+            if m == GESTURE_TRANSITION and trans_ok:
                 out[i] = GESTURE_TRANSITION
             else:
-                out[i] = GESTURE_GLISSANDO
+                # Prefer steady over dubious glissando; demote pass confirms slides.
+                out[i] = GESTURE_STEADY
         elif h == GESTURE_VIBRATO:
-            if m == GESTURE_TRANSITION and trans_p >= transition_conf_min:
+            if m == GESTURE_TRANSITION and trans_ok:
                 out[i] = GESTURE_TRANSITION
             else:
                 out[i] = GESTURE_VIBRATO
         elif h == GESTURE_STEADY:
-            if m == GESTURE_TRANSITION and trans_p >= transition_conf_min:
+            if m == GESTURE_TRANSITION and trans_ok:
                 out[i] = GESTURE_TRANSITION
-            elif m == GESTURE_GLISSANDO and gliss_p >= 0.52:
-                out[i] = GESTURE_GLISSANDO
             else:
-                # Never promote steady→vibrato from model alone (v3 precision ~27%).
-                # Genuine vibrato comes from heuristics + band-pass overlay.
+                # Never promote steady→vibrato or steady→glissando from model alone.
                 out[i] = GESTURE_STEADY
-        elif m != GESTURE_STEADY and c >= model_confidence:
+        elif m == GESTURE_TRANSITION and trans_ok:
+            out[i] = GESTURE_TRANSITION
+        elif m == GESTURE_VIBRATO and vib_p >= vibrato_prob_min:
+            out[i] = GESTURE_VIBRATO
+        elif m != GESTURE_STEADY and m != GESTURE_GLISSANDO and c >= model_confidence:
             out[i] = m
-        elif c >= 0.65:
+        elif c >= 0.65 and m != GESTURE_GLISSANDO:
             out[i] = m
     return out
 
@@ -647,12 +717,9 @@ def smooth_gesture_label(
         n_trans = int(np.sum(recent == GESTURE_TRANSITION))
         if n_vib >= max(9, int(win * 0.16)):
             return GESTURE_VIBRATO
-        if n_gliss >= max(8, int(win * 0.14)) and n_gliss >= n_trans:
-            return GESTURE_GLISSANDO
         if n_trans >= max(4, int(win * 0.10)):
             return GESTURE_TRANSITION
-        if n_gliss >= max(8, int(win * 0.14)):
-            return GESTURE_GLISSANDO
+        # Glissando omitted from live readout — coaching prioritises steady / vibrato / transition.
 
     if len(recent) == 0:
         return GESTURE_STEADY

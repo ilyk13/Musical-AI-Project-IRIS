@@ -1,0 +1,50 @@
+{
+  "checkpoint": "runs/gesture_tcn_3class/checkpoints/best.pth",
+  "results": {
+    "n_classes": 3,
+    "n_clips": 188,
+    "n_frames": 250664,
+    "gesture": {
+      "accuracy": 0.7684,
+      "macro_f1": 0.5057,
+      "balanced_acc": 0.6687,
+      "per_class": {
+        "steady": {
+          "precision": 0.9627,
+          "recall": 0.7832,
+          "f1": 0.8637,
+          "support": 228833
+        },
+        "vibrato": {
+          "precision": 0.3538,
+          "recall": 0.6189,
+          "f1": 0.4502,
+          "support": 13593
+        },
+        "transition": {
+          "precision": 0.1222,
+          "recall": 0.6042,
+          "f1": 0.2033,
+          "support": 8238
+        }
+      },
+      "confusion_matrix": [
+        [
+          179214,
+          14947,
+          34672
+        ],
+        [
+          4101,
+          8413,
+          1079
+        ],
+        [
+          2843,
+          418,
+          4977
+        ]
+      ]
+    }
+  }
+}

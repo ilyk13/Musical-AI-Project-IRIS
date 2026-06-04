@@ -39,9 +39,9 @@ from features.pitch.gesture import (
     gesture_index,
     is_scored_gesture,
     merge_gesture_predictions,
+    demote_glissando_for_coaching,
     overlay_vibrato_from_deviation,
     provisional_f0_from_posteriors,
-    boost_glissando_labels,
     coalesce_glissando_labels,
     reconcile_false_glissando,
     reconcile_false_vibrato,
@@ -59,13 +59,15 @@ from features.vibrato.bandpass import bandpass_vibrato
 from features.dynamics.dynamic_class import classify_dynamic
 from data.vocalset_labels import REGISTER_VOCAB, DYNAMIC_VOCAB
 from features.breath.cpp import compute_cpp
-from features.breath.phrase import PhraseTracker, breath_window_from_roll
+from features.breath.phrase import PhraseTracker, breath_window_from_roll, MIN_PHRASE_FRAMES
 from features.breath.spectral_tilt import compute_spectral_tilt_slope
 from features.vibrato.bandpass import bandpass_vibrato
 from features.vibrato.parameters import extract_vibrato_params
 from features.pitch.pitch_drift import analyze_drift, aggregate_drift_score
 from model.nanopitch import viterbi_stream
 from model.breath_cnn import BreathCNN, DEFAULT_WINDOW as BREATH_WINDOW
+from model.gesture_classes import expand_logits_to_4class
+from model.gesture_tcn import GestureTCN
 
 # ── Constants ──────────────────────────────────────────────────────────
 SR             = 16_000
@@ -100,12 +102,26 @@ NANOPITCH_PLUS_CANDIDATES = [
 BREATH_CHECKPOINT_CANDIDATES = [
     Path(__file__).parent / "runs" / "breath_cnn" / "checkpoints" / "best.pth",
 ]
+GESTURE_TCN_CANDIDATES = [
+    Path(__file__).parent / "runs" / "gesture_tcn_3class" / "checkpoints" / "best.pth",
+    Path(__file__).parent / "runs" / "gesture_tcn" / "checkpoints" / "best.pth",
+]
+# GestureTCN 3-class merge — tuned for precision (fewer steady→transition FPs).
+TCN_MERGE_KW = dict(
+    transition_conf_min=0.86,
+    transition_prob_min=0.52,
+    transition_margin=0.18,
+    vibrato_prob_min=0.74,
+    model_confidence=0.55,
+)
 _extractor: NanoPitchExtractor | None = None
 _breath_model: BreathCNN | None = None
+_gesture_tcn: GestureTCN | None = None
 _breath_window: int = BREATH_WINDOW
 _checkpoint_used: Path | None = None
 _breath_checkpoint_used: Path | None = None
-_gesture_source: str = "heuristic"  # heuristic | model
+_gesture_tcn_checkpoint_used: Path | None = None
+_gesture_source: str = "heuristic"  # heuristic | tcn | model
 
 
 def _resolve_plus_checkpoint() -> Path | None:
@@ -115,6 +131,18 @@ def _resolve_plus_checkpoint() -> Path | None:
         p = Path(env).expanduser()
         return p if p.exists() else None
     for p in NANOPITCH_PLUS_CANDIDATES:
+        if p.exists():
+            return p
+    return None
+
+
+def _resolve_gesture_tcn_checkpoint() -> Path | None:
+    import os
+    env = os.environ.get("GESTURE_TCN_CHECKPOINT")
+    if env:
+        p = Path(env).expanduser()
+        return p if p.exists() else None
+    for p in GESTURE_TCN_CANDIDATES:
         if p.exists():
             return p
     return None
@@ -164,19 +192,14 @@ def _load_and_warmup(
     use_plus_head: bool = False,
 ) -> NanoPitchExtractor:
     """Load pitch model; optionally attach Plus gesture head without replacing pitch weights."""
-    global _gesture_source
     if use_plus_head and plus_ckpt and pitch_ckpt:
         ext = NanoPitchExtractor.from_hybrid_checkpoints(pitch_ckpt, plus_ckpt)
-        _gesture_source = "model"
     elif use_plus_head and plus_ckpt:
         ext = NanoPitchExtractor.from_checkpoint(plus_ckpt, prefer_plus=True)
-        _gesture_source = "model"
     elif pitch_ckpt:
         ext = NanoPitchExtractor.from_checkpoint(pitch_ckpt)
-        _gesture_source = "heuristic"
     else:
         ext = NanoPitchExtractor.from_pretrained(local_path=None)
-        _gesture_source = "heuristic"
 
     state = ext.model.init_streaming_state()
     dummy_buf = np.zeros(MEL_MIN_TAIL, dtype=np.float32)
@@ -191,9 +214,17 @@ def _load_and_warmup(
 @app.on_event("startup")
 async def _startup() -> None:
     global _extractor, _checkpoint_used, _breath_model, _breath_checkpoint_used
+    global _gesture_tcn, _gesture_tcn_checkpoint_used, _gesture_source
     import os
     use_plus = os.environ.get("NANOPITCH_USE_PLUS", "").lower() in ("1", "true", "yes")
+    use_tcn = os.environ.get("GESTURE_USE_TCN", "").lower() in ("1", "true", "yes")
     plus_ckpt = _resolve_plus_checkpoint() if use_plus else None
+    tcn_ckpt = _resolve_gesture_tcn_checkpoint() if use_tcn else None
+    if not use_tcn and not os.environ.get("GESTURE_USE_TCN"):
+        auto = _resolve_gesture_tcn_checkpoint()
+        if auto is not None:
+            tcn_ckpt = auto
+            use_tcn = True
     pitch_ckpt = _resolve_checkpoint()
     if pitch_ckpt and "exp4-cosine-logits" in str(pitch_ckpt):
         print(
@@ -234,6 +265,20 @@ async def _startup() -> None:
         print(f"BreathCNN ready — {breath_ckpt} (live phrase boundaries)")
     else:
         print("BreathCNN not loaded — phrasing uses silence gaps only")
+
+    _gesture_source = "heuristic"
+    if tcn_ckpt:
+        _gesture_tcn_checkpoint_used = tcn_ckpt
+        _gesture_tcn = await asyncio.to_thread(
+            GestureTCN.load_checkpoint, str(tcn_ckpt), "cpu",
+        )
+        _gesture_source = "tcn"
+        ncls = _gesture_tcn.n_classes
+        print(
+            f"GestureTCN ready — {tcn_ckpt} ({ncls}-class, merge: tcn + heuristics)"
+        )
+    elif use_plus and plus_ckpt:
+        _gesture_source = "model"
 
 
 _NOTE_NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B']
@@ -296,6 +341,7 @@ class ClientState:
     phrase_tracker:     PhraseTracker = field(default_factory=PhraseTracker)
     phrase_info:        dict = field(default_factory=dict)
     phrase_boundaries:  list = field(default_factory=list)
+    gesture_feat_stream: object | None = field(default=None)
 
 
 def _pitch_dev_cents(hz: float, central_hz: float | None) -> float:
@@ -390,6 +436,11 @@ def _track_phrases(
             else:
                 ev_out["vocal_end_t"] = round(m.end_t, 3)
                 ev_out["vocal_end_samples"] = int(round(m.end_t * SR))
+                ev_out["phrase_start_t"] = round(
+                    float(last_info.get("phrase_start_t", m.start_t)), 3,
+                )
+                ev_out["vocal_start_t"] = round(m.start_t, 3)
+                ev_out["vocal_start_samples"] = int(round(m.start_t * SR))
             boundary_events.append(ev_out)
 
     return phrase_ids, last_info, boundary_events
@@ -477,7 +528,24 @@ def _extract(state: ClientState, chunk: np.ndarray,
                 raw_track = np.array(list(state.raw_f0_history), dtype=np.float32)
                 heuristic_gest = classify_gestures_live(raw_track, posteriorgram=post)[-len(prov):]
 
-                if gesture_logits:
+                if _gesture_tcn is not None:
+                    if state.gesture_feat_stream is None:
+                        state.gesture_feat_stream = _gesture_tcn.init_stream()
+                    tcn_logits: list[np.ndarray] = []
+                    for pf, prow in zip(prov, post):
+                        voiced = 1.0 if (pf > 0 and float(prow.max()) > 0.08) else 0.0
+                        feat_win = state.gesture_feat_stream.push(float(pf), voiced)
+                        logit = _gesture_tcn.predict_frame(feat_win)
+                        tcn_logits.append(logit.numpy())
+                    tcn_stack = np.stack(tcn_logits)
+                    if _gesture_tcn.n_classes == 3:
+                        tcn_stack = expand_logits_to_4class(tcn_stack)
+                    gest_arr = merge_gesture_predictions(
+                        heuristic_gest,
+                        tcn_stack,
+                        **TCN_MERGE_KW,
+                    )
+                elif gesture_logits:
                     gest_arr = merge_gesture_predictions(
                         heuristic_gest,
                         np.stack(gesture_logits),
@@ -582,16 +650,7 @@ def _extract(state: ClientState, chunk: np.ndarray,
         else np.zeros(n_new, dtype=np.float32)
     )
 
-    # Viterbi f0 is smoother than raw argmax — recover slides the slope detector misses.
-    if len(f0_arr) and np.any(f0_arr > 0):
-        vit_track = np.array(list(state.f0_history) + list(f0_arr), dtype=np.float32)
-        vit_seg = vit_track[-len(f0_arr):]
-        gesture_arr = boost_glissando_labels(
-            gesture_arr, vit_seg,
-            vibrato_mask=(gesture_arr == GESTURE_VIBRATO),
-        ).astype(np.int8)
-
-    # Align gesture labels with vibrato deviation chart (same band-pass signal).
+    # Vibrato / transition reconciliation (no glissando boost — FP hurts coaching).
     if len(vib_latest) and np.any(f0_arr > 0):
         gesture_arr = overlay_vibrato_from_deviation(
             gesture_arr, f0_arr, vib_latest,
@@ -602,11 +661,10 @@ def _extract(state: ClientState, chunk: np.ndarray,
         gesture_arr = reconcile_false_glissando(
             gesture_arr, f0_arr, vib_latest,
         ).astype(np.int8)
-        gesture_arr = coalesce_glissando_labels(gesture_arr).astype(np.int8)
-        gesture_arr = boost_glissando_labels(
-            gesture_arr, f0_arr,
-            vibrato_mask=(gesture_arr == GESTURE_VIBRATO),
+        gesture_arr = demote_glissando_for_coaching(
+            gesture_arr, f0_arr, vib_latest,
         ).astype(np.int8)
+        gesture_arr = coalesce_glissando_labels(gesture_arr).astype(np.int8)
 
     for g in gesture_arr:
         state.gesture_history.append(int(g))
@@ -673,7 +731,7 @@ def _extract(state: ClientState, chunk: np.ndarray,
     recent_slice        = gesture_hist[-45:]
     win_len             = max(len(recent_slice), 1)
     glissando_active    = (
-        int(np.sum(recent_slice == GESTURE_GLISSANDO)) >= max(8, int(win_len * 0.14))
+        int(np.sum(recent_slice == GESTURE_GLISSANDO)) >= max(18, int(win_len * 0.30))
     )
     n_vib_recent = int(np.sum(recent_slice == GESTURE_VIBRATO))
     vibrato_active      = (
@@ -723,6 +781,12 @@ def _extract(state: ClientState, chunk: np.ndarray,
                 ev["vocal_end_t"] = be["vocal_end_t"]
             if "vocal_end_samples" in be:
                 ev["vocal_end_samples"] = be["vocal_end_samples"]
+            if "phrase_start_t" in be:
+                ev["phrase_start_t"] = be["phrase_start_t"]
+            if "vocal_start_t" in be:
+                ev["vocal_start_t"] = be["vocal_start_t"]
+            if "vocal_start_samples" in be:
+                ev["vocal_start_samples"] = be["vocal_start_samples"]
         phrase_events_batch.append(ev)
         state.phrase_boundaries.append(ev)
 
@@ -943,6 +1007,112 @@ def _segment_phrases(
     return phrases or [(0, len(f0))]
 
 
+MIN_PHRASE_S = MIN_PHRASE_FRAMES / 100.0
+
+
+def _phrase_ranges_from_events(
+    phrase_events: list[dict],
+    t: np.ndarray,
+    session_end_t: float,
+) -> list[tuple[int, int, float, float, int, int, int, float]]:
+    """Map live start/end events to analysis phrase ranges (one card per line)."""
+    if not phrase_events or len(t) == 0:
+        return []
+
+    events_sorted = sorted(
+        [
+            e for e in phrase_events
+            if isinstance(e, dict) and str(e.get("event")) in ("start", "end")
+        ],
+        key=lambda e: (float(e.get("t", 0.0)), str(e.get("event"))),
+    )
+    starts: dict[int, dict] = {}
+    ends: dict[int, dict] = {}
+
+    for e in events_sorted:
+        pid = int(e.get("phrase_id", 0) or 0)
+        if pid <= 0:
+            continue
+        ev = str(e.get("event"))
+        if ev == "start":
+            starts[pid] = e
+        elif ev == "end":
+            ends[pid] = e
+
+    ranges: list[tuple[int, int, float, float, int, int, int, float]] = []
+    seen: set[int] = set()
+
+    def _append(pid: int, start_ev: dict | None, end_ev: dict) -> None:
+        if pid in seen:
+            return
+        end_t = float(end_ev.get("t", 0.0) or 0.0)
+        boundary_ts = float(
+            (start_ev or {}).get("t")
+            or end_ev.get("phrase_start_t")
+            or end_ev.get("boundary_start_t")
+            or 0.0,
+        )
+        if boundary_ts <= 0:
+            boundary_ts = max(0.0, end_t - 1.0)
+        if end_t <= boundary_ts:
+            return
+        if (end_t - boundary_ts) < MIN_PHRASE_S * 0.75:
+            return
+
+        vocal_ts = float(
+            (start_ev or {}).get("vocal_start_t")
+            or end_ev.get("vocal_start_t")
+            or boundary_ts,
+        )
+        v_end_t = float(end_ev.get("vocal_end_t") or end_t)
+        start_s = int(
+            (start_ev or {}).get("vocal_start_samples")
+            or end_ev.get("vocal_start_samples")
+            or round(vocal_ts * SR),
+        )
+        end_s = int(end_ev.get("vocal_end_samples") or round(v_end_t * SR))
+
+        i0 = int(np.searchsorted(t, min(vocal_ts, boundary_ts), side="left"))
+        i1 = int(np.searchsorted(t, v_end_t, side="right"))
+        if i1 <= i0:
+            i0 = int(np.searchsorted(t, boundary_ts, side="left"))
+            i1 = int(np.searchsorted(t, end_t, side="right"))
+        if i1 <= i0:
+            i1 = min(len(t), i0 + 5)
+        if i1 - i0 < 3:
+            return
+
+        ranges.append((
+            max(0, i0), min(len(t), i1),
+            vocal_ts, v_end_t,
+            start_s, end_s,
+            pid, boundary_ts,
+        ))
+        seen.add(pid)
+
+    for pid, end_ev in sorted(ends.items()):
+        _append(pid, starts.get(pid), end_ev)
+
+    # Lines still in progress when the session ends (start marker, no end yet).
+    for pid, start_ev in sorted(starts.items()):
+        if pid in seen:
+            continue
+        start_t = float(start_ev.get("t", 0.0) or 0.0)
+        if session_end_t - start_t < MIN_PHRASE_S * 0.75:
+            continue
+        _append(pid, start_ev, {
+            "t": session_end_t,
+            "vocal_end_t": session_end_t,
+            "vocal_end_samples": int(round(session_end_t * SR)),
+            "phrase_start_t": start_t,
+            "vocal_start_t": start_ev.get("vocal_start_t"),
+            "vocal_start_samples": start_ev.get("vocal_start_samples"),
+        })
+
+    ranges.sort(key=lambda r: (r[7], r[6]))
+    return ranges
+
+
 def _phrase_bullets(
     pitch_score: float,
     drift_results: list,
@@ -1095,72 +1265,32 @@ def _run_analysis(frames: list[dict], summaries: list[dict], phrase_events: list
         dtype=np.float32,
     )
 
-    # (frame_start, frame_end, vocal_start_t, vocal_end_t, start_sample, end_sample, phrase_id)
-    phrase_ranges: list[tuple[int, int, float, float, int, int, int]] = []
-    if phrase_events:
-        # Prefer live phrase boundaries when provided (aligns review with UI markers).
-        try:
-            events_sorted = sorted(
-                [e for e in phrase_events if isinstance(e, dict) and "event" in e and "t" in e],
-                key=lambda e: float(e.get("t", 0.0)),
-            )
-            starts: dict[int, float] = {}
-            start_samples: dict[int, int] = {}
-            vocal_start_samples: dict[int, int] = {}
-            vocal_start_t_map: dict[int, float] = {}
-            for e in events_sorted:
-                ev = str(e.get("event"))
-                pid = int(e.get("phrase_id", 0) or 0)
-                tt = float(e.get("t", 0.0) or 0.0)
-                if pid <= 0:
-                    continue
-                if ev == "start":
-                    starts[pid] = tt
-                    start_samples[pid] = int(e.get("samples", round(tt * SR)))
-                    vt = float(e.get("vocal_start_t", tt))
-                    vocal_start_t_map[pid] = vt
-                    vs = e.get("vocal_start_samples")
-                    vocal_start_samples[pid] = int(vs) if vs is not None else int(
-                        round(vt * SR)
-                    )
-                elif ev == "end" and pid in starts and tt > starts[pid]:
-                    ts = starts[pid]
-                    i0 = int(np.searchsorted(t, ts, side="left"))
-                    i1 = int(np.searchsorted(t, tt, side="right"))
-                    if i1 - i0 >= max(5, int(0.5 * fps)):
-                        v_end_t = float(e.get("vocal_end_t", tt))
-                        v_end_s = e.get("vocal_end_samples")
-                        end_s = int(v_end_s) if v_end_s is not None else int(
-                            round(v_end_t * SR)
-                        )
-                        start_s = vocal_start_samples.get(
-                            pid,
-                            start_samples.get(pid, int(round(ts * SR))),
-                        )
-                        phrase_ranges.append((
-                            max(0, i0), min(len(t), i1),
-                            vocal_start_t_map.get(pid, ts),
-                            v_end_t,
-                            start_s, end_s,
-                            pid,
-                        ))
-        except Exception:
-            phrase_ranges = []
+    # (frame_start, frame_end, vocal_start_t, vocal_end_t, start_sample, end_sample,
+    #  phrase_id, boundary_start_t)
+    session_end_t = float(t[-1]) if len(t) else 0.0
+    phrase_ranges = _phrase_ranges_from_events(phrase_events or [], t, session_end_t)
 
     if not phrase_ranges:
-        for i0, i1 in _segment_phrases(f0, t, min_silence_s=0.55, min_phrase_s=0.7):
+        for seg_idx, (i0, i1) in enumerate(
+            _segment_phrases(f0, t, min_silence_s=0.55, min_phrase_s=0.7),
+        ):
             ts = float(t[i0])
             te = float(t[min(i1 - 1, len(t) - 1)])
             phrase_ranges.append((
                 i0, i1, ts, te,
                 int(round(ts * SR)), int(round(te * SR)),
-                idx + 1,
+                seg_idx + 1,
+                ts,
             ))
+
+    phrase_ranges.sort(key=lambda r: (r[6], r[7]))
 
     # ── Phase 1: compute per-phrase metrics ───────────────────────────
     phrase_metrics: list[dict] = []
     phrase_mean_dbfs_list: list[float] = []
-    for idx, (start, end, t_start, t_end, start_smp, end_smp, phrase_id) in enumerate(phrase_ranges):
+    for _idx, (
+        start, end, t_start, t_end, start_smp, end_smp, phrase_id, boundary_start_t,
+    ) in enumerate(phrase_ranges):
         f0_p      = f0[start:end]
         central_p = central[start:end]
         vib_p     = vib[start:end]
@@ -1281,11 +1411,12 @@ def _run_analysis(frames: list[dict], summaries: list[dict], phrase_events: list
         phrase_mean_dbfs_list.append(phrase_mean_dbfs)
 
         phrase_metrics.append({
-            "idx":          idx,
-            "t_start":      t_start,
-            "t_end":        t_end,
-            "start_sample": start_smp,
-            "end_sample":   end_smp,
+            "idx":               phrase_id,
+            "boundary_start_t":  boundary_start_t,
+            "t_start":           t_start,
+            "t_end":             t_end,
+            "start_sample":      start_smp,
+            "end_sample":        end_smp,
             "pitch_score":  pitch_score,
             "drift_results": drift_results,
             "vp":           vp,
@@ -1354,8 +1485,8 @@ def _run_analysis(frames: list[dict], summaries: list[dict], phrase_events: list
             elif delta <= -6.0:
                 bullets.append("Quieter than your other phrases")
         phrase_results.append({
-            "idx":            m["idx"] + 1,
-            "start_t":        round(m["t_start"], 2),
+            "idx":            m["idx"],
+            "start_t":        round(m["boundary_start_t"], 2),
             "end_t":          round(m["t_end"], 2),
             "start_sample":   int(m["start_sample"]),
             "end_sample":     int(m["end_sample"]),

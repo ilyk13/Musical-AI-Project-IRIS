@@ -212,16 +212,6 @@
     .vib-param-val { font-size: 1.3rem; font-weight: 700; line-height: 1; transition: color 0.3s; }
     .vib-param-lbl { font-size: 0.6rem; color: var(--dim); text-transform: uppercase; letter-spacing: 1px; }
 
-    /* Voice character card — register colors */
-    .reg-chest    { color: var(--orange); }
-    .reg-mixed    { color: var(--green);  }
-    .reg-head     { color: var(--blue);   }
-    .reg-falsetto { color: var(--purple); }
-    .voice-char-conf {
-      font-size: 0.59rem; color: var(--dim); margin-top: 4px;
-      letter-spacing: 0.5px;
-    }
-
     /* ── Coaching Cards ────────────────────────────────────────────── */
     .coaching-section {
       background: var(--card); border: 1px solid var(--border);
@@ -486,6 +476,10 @@
       letter-spacing: 0.5px; color: var(--dim); margin-bottom: 6px;
     }
     .modal-chart-wrap { position: relative; height: 155px; }
+    .modal-chart-empty {
+      position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+      font-size: 0.74rem; color: var(--dim); text-align: center; padding: 12px;
+    }
   </style>
 </head>
 <body>
@@ -611,22 +605,6 @@
         <div class="fb-label">Phrase Boundaries</div>
         <div class="fb-main dim" id="phraseVal">—</div>
         <div class="fb-sub" id="phraseSub">Markers appear on the chart</div>
-      </div>
-
-      <!-- Voice Character: register + model dynamics (NanoPitch+ only) -->
-      <div class="fb-block">
-        <div class="fb-label">Voice Character</div>
-        <div class="vib-params">
-          <div class="vib-param">
-            <div class="vib-param-val dim" id="registerVal">—</div>
-            <div class="vib-param-lbl">Register</div>
-          </div>
-          <div class="vib-param">
-            <div class="vib-param-val dim" id="modelDynVal">—</div>
-            <div class="vib-param-lbl">Level</div>
-          </div>
-        </div>
-        <div class="voice-char-conf" id="registerConf"></div>
       </div>
 
       <!-- Live Feedback coaching cards -->
@@ -768,9 +746,14 @@
         <div class="modal-chart-pane-lbl">Pitch  (f0 colored by ET accuracy · dashed = central)</div>
         <div class="modal-chart-wrap"><canvas id="modalPitchChart"></canvas></div>
       </div>
-      <div class="modal-chart-pane">
-        <div class="modal-chart-pane-lbl">Vibrato deviation (¢ from central)</div>
-        <div class="modal-chart-wrap"><canvas id="modalVibratoChart"></canvas></div>
+      <div class="modal-chart-pane" id="modalVibratoPane">
+        <div class="modal-chart-pane-lbl" id="modalVibratoLbl">Vibrato deviation (¢ from central)</div>
+        <div class="modal-chart-wrap" id="modalVibratoWrap">
+          <canvas id="modalVibratoChart"></canvas>
+          <div class="modal-chart-empty" id="modalVibratoEmpty" style="display:none;">
+            No vibrato detected — band-pass modulation is hidden for steady phrases.
+          </div>
+        </div>
       </div>
       <div class="modal-chart-pane">
         <div class="modal-chart-pane-lbl">Breathiness — CPP (↑ clearer)</div>
@@ -1132,6 +1115,36 @@
     return sample;
   }
 
+  function _phraseEventsForAnalyze() {
+    const events = allPhraseEvents.map(ev => ({ ...ev }));
+    const starts = new Map();
+    const ended = new Set();
+    for (const ev of events) {
+      const pid = ev.phrase_id;
+      if (!pid) continue;
+      if (ev.event === 'start') starts.set(pid, ev);
+      if (ev.event === 'end') ended.add(pid);
+    }
+    const lastT = allFrames.length ? allFrames[allFrames.length - 1].t : 0;
+    for (const [pid, startEv] of starts) {
+      if (ended.has(pid)) continue;
+      if (lastT - (startEv.t || 0) < 0.35) continue;
+      events.push({
+        event: 'end',
+        phrase_id: pid,
+        t: lastT,
+        samples: Math.round(lastT * SR16),
+        phrase_start_t: startEv.t,
+        vocal_start_t: startEv.vocal_start_t ?? startEv.t,
+        vocal_start_samples: startEv.vocal_start_samples ?? startEv.samples,
+        vocal_end_t: lastT,
+        vocal_end_samples: Math.round(lastT * SR16),
+        feedback: null,
+      });
+    }
+    return events;
+  }
+
   function _onPhraseEvent(ev) {
     if (!ev || !ev.event) return;
     allPhraseEvents.push({
@@ -1139,6 +1152,7 @@
       phrase_id: ev.phrase_id,
       t: ev.t,
       samples: ev.samples != null ? ev.samples : Math.round((ev.t || 0) * SR16),
+      phrase_start_t: ev.phrase_start_t,
       vocal_start_t: ev.vocal_start_t,
       vocal_start_samples: ev.vocal_start_samples,
       vocal_end_t: ev.vocal_end_t,
@@ -1172,50 +1186,6 @@
   function _onPhraseEvents(events) {
     if (!events || !events.length) return;
     events.forEach(_onPhraseEvent);
-  }
-
-  // ── Voice Character (register + model dynamics) ───────────────────
-  const REGISTER_COLOR = {
-    chest:    'reg-chest',
-    mixed:    'reg-mixed',
-    head:     'reg-head',
-    falsetto: 'reg-falsetto',
-  };
-
-  // Dynamic level → color class reusing the existing helpers
-  function dynLevelClass(label) {
-    if (!label) return 'dim';
-    const loud = ['f', 'ff'];
-    const soft = ['pp', 'p'];
-    if (loud.includes(label)) return 'good';
-    if (soft.includes(label)) return 'dim';
-    return 'warn';
-  }
-
-  function updateVoiceCharBlock(s, voiced) {
-    const regEl   = document.getElementById('registerVal');
-    const dynEl   = document.getElementById('modelDynVal');
-    const confEl  = document.getElementById('registerConf');
-    const hasModel = s.register != null;
-
-    if (!voiced || !hasModel) {
-      regEl.textContent = '—';  regEl.className = 'vib-param-val dim';
-      dynEl.textContent = '—';  dynEl.className = 'vib-param-val dim';
-      confEl.textContent = hasModel ? '' : 'Base model — load NanoPitch+ for register';
-      return;
-    }
-
-    const reg  = s.register;                          // 'chest'|'mixed'|'head'|'falsetto'
-    const conf = s.register_conf;                     // 0–100 integer
-    const dyn  = s.model_dynamic;                     // 'pp'|'p'|'mp'|'mf'|'f'|'ff'
-
-    regEl.textContent = reg.charAt(0).toUpperCase() + reg.slice(1);
-    regEl.className   = 'vib-param-val ' + (REGISTER_COLOR[reg] || '');
-
-    dynEl.textContent = dyn ?? '—';
-    dynEl.className   = 'vib-param-val ' + dynLevelClass(dyn);
-
-    confEl.textContent = conf != null ? `${conf}% register confidence` : '';
   }
 
   // ── Coaching cards ────────────────────────────────────────────────
@@ -1608,7 +1578,6 @@
         updateBreathinessBlock(sidebar, sidebarVoiced);
         updateVibratoBlock(sidebar, sidebarVoiced);
         updatePhraseBlock(s, sidebarVoiced);
-        updateVoiceCharBlock(sidebar, sidebarVoiced);
         updateCoaching(s, displayActive);
         _lastSidebarUpdate = now;
       }
@@ -1637,7 +1606,11 @@
       const resp = await fetch('/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ frames: allFrames, summaries: allSummaries, phrase_events: allPhraseEvents }),
+        body: JSON.stringify({
+          frames: allFrames,
+          summaries: allSummaries,
+          phrase_events: _phraseEventsForAnalyze(),
+        }),
       });
       result = await resp.json();
     } catch (err) {
@@ -1737,19 +1710,17 @@
       phrases.forEach((ph, i) => {
         const xPos = scales.x.getPixelForValue(ph.start_t);
         if (xPos < chartArea.left || xPos > chartArea.right) return;
-        if (i > 0) {
-          ctx.strokeStyle = '#44446680';
-          ctx.lineWidth   = 1;
-          ctx.setLineDash([3, 3]);
-          ctx.beginPath();
-          ctx.moveTo(xPos, chartArea.top);
-          ctx.lineTo(xPos, chartArea.bottom);
-          ctx.stroke();
-          ctx.setLineDash([]);
-          ctx.fillStyle = '#7eb8f7cc';
-          ctx.font = `9px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif`;
-          ctx.fillText('phrase', xPos + 4, chartArea.top + 10);
-        }
+        ctx.strokeStyle = '#44446680';
+        ctx.lineWidth   = 1;
+        ctx.setLineDash([3, 3]);
+        ctx.beginPath();
+        ctx.moveTo(xPos, chartArea.top);
+        ctx.lineTo(xPos, chartArea.bottom);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = '#7eb8f7cc';
+        ctx.font = `9px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif`;
+        ctx.fillText(`P${ph.idx || (i + 1)}`, xPos + 4, chartArea.top + 10);
       });
       ctx.restore();
     },
@@ -2045,25 +2016,34 @@
       options: sharedOpts(f0Min, f0Max, v => Math.round(v) + ' Hz'),
     });
 
-    // ── 2. Vibrato chart ────────────────────────────────────────────
-    const vibPts = pFrames.map(f => ({
-      x: rT(f),
-      y: (f.vib != null && !isNaN(f.vib)) ? f.vib : null,
-    }));
-    const vibVals = vibPts.map(p => p.y).filter(v => v != null);
-    const vibExt  = vibVals.length
-      ? Math.max(30, Math.ceil(Math.max(...vibVals.map(Math.abs)) * 1.15 / 10) * 10)
-      : 50;
+    // ── 2. Vibrato chart (only when phrase was scored as vibrato) ───
+    const showVibChart = !!(ph.has_vibrato || ph.vib_score != null);
+    document.getElementById('modalVibratoEmpty').style.display = showVibChart ? 'none' : 'flex';
+    document.getElementById('modalVibratoChart').style.display = showVibChart ? 'block' : 'none';
+    document.getElementById('modalVibratoLbl').textContent = showVibChart
+      ? 'Vibrato deviation (¢ from central)'
+      : 'Vibrato';
 
-    _modalCharts.vibrato = new Chart(document.getElementById('modalVibratoChart'), {
-      type: 'line',
-      data: { datasets: [{
-        label: 'Vibrato (¢)', data: vibPts, parsing: false,
-        borderColor: '#a29bfe', borderWidth: 1.5,
-        pointRadius: 0, tension: 0, spanGaps: false,
-      }]},
-      options: sharedOpts(-vibExt, vibExt, v => v + '¢'),
-    });
+    if (showVibChart) {
+      const vibPts = pFrames.map(f => ({
+        x: rT(f),
+        y: (f.vib != null && !isNaN(f.vib)) ? f.vib : null,
+      }));
+      const vibVals = vibPts.map(p => p.y).filter(v => v != null);
+      const vibExt  = vibVals.length
+        ? Math.max(30, Math.ceil(Math.max(...vibVals.map(Math.abs)) * 1.15 / 10) * 10)
+        : 50;
+
+      _modalCharts.vibrato = new Chart(document.getElementById('modalVibratoChart'), {
+        type: 'line',
+        data: { datasets: [{
+          label: 'Vibrato (¢)', data: vibPts, parsing: false,
+          borderColor: '#a29bfe', borderWidth: 1.5,
+          pointRadius: 0, tension: 0, spanGaps: false,
+        }]},
+        options: sharedOpts(-vibExt, vibExt, v => v + '¢'),
+      });
+    }
 
     // ── 3. Breathiness (CPP) chart ──────────────────────────────────
     const cppPts = pSumms.map(s => ({ x: rT(s), y: s.cpp ?? 0 }));
